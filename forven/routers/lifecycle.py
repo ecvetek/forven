@@ -73,6 +73,29 @@ def read_gauntlet_status(strategy_id: str):
     return get_strategy_gauntlet_status(strategy_id)
 
 
+@router.get("/api/lifecycle/pipeline/explain")
+def read_pipeline_explain(stage: str | None = None, limit: int = 200):
+    """Fleet-wide pipeline explanation.
+
+    For every strategy in an active stage: why it is stuck (gate + readiness
+    blockers, classified evidence-vs-merit), which evidence is missing or stale
+    and how old what exists is, the specific unblocking action, and the expected
+    next transition. Read-only: gates are evaluated in dry_run mode and never
+    record rejections, queue dethrones, or mutate state.
+    """
+    from forven.pipeline_explain import explain_pipeline
+
+    return explain_pipeline(stage=stage, limit=limit)
+
+
+@router.get("/api/lifecycle/strategies/{strategy_id}/explain")
+def read_strategy_explain(strategy_id: str):
+    """Single-strategy pipeline explanation (same shape as the fleet entries)."""
+    from forven.pipeline_explain import explain_strategy
+
+    return explain_strategy(strategy_id)
+
+
 @router.get("/api/lifecycle/strategies/{strategy_id}/paper-live-readiness")
 def read_paper_live_readiness(strategy_id: str):
     """Return a paper-to-live readiness checklist for a strategy.

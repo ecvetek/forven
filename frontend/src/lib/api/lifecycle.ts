@@ -700,6 +700,138 @@ export async function getPaperLiveReadiness(strategyId: string): Promise<Promoti
 	return fetchApi(`/lifecycle/strategies/${strategyId}/paper-live-readiness`);
 }
 
+// ── Explainable pipeline ────────────────────────────────────────────────────
+
+export interface PipelineExplainAction {
+	key: string;
+	label: string;
+}
+
+export interface PipelineExplainBlocker {
+	reason: string;
+	// Gate-rejection taxonomy code (e.g. missing_evidence, validation_in_flight).
+	code: string;
+	// 'evidence' = absence/staleness (resolves by producing evidence),
+	// 'merit' = measured and failed a quality bar, 'contention' = slot conflict,
+	// 'advisory' = non-required readiness warning.
+	kind: 'evidence' | 'merit' | 'contention' | 'advisory' | string;
+	source: string;
+	action: PipelineExplainAction | null;
+	step?: string;
+	extra?: { current?: number; threshold?: number; direction?: string; unit?: string } | null;
+}
+
+export interface PipelineExplainTransition {
+	to_stage: string | null;
+	label: string;
+	trigger: string | null;
+}
+
+export interface PipelineExplainValidationEvidence {
+	status: string | null;
+	verdict: string | null;
+	at: string | null;
+	age_days: number | null;
+	stale: boolean | null;
+	stale_engine: boolean | null;
+}
+
+export interface PipelineExplainEvidence {
+	last_backtest_at?: string;
+	last_backtest_age_days?: number;
+	last_optimization_at?: string;
+	last_optimization_age_days?: number;
+	validation_tests?: Record<string, PipelineExplainValidationEvidence>;
+	paper?: {
+		paper_duration?: { current: number; threshold: number; unit: string };
+		paper_trades?: { current: number; threshold: number; unit: string };
+		last_trade_at?: string;
+		last_trade_age_days?: number;
+	};
+}
+
+export type PipelineExplainStatus =
+	| 'ready'
+	| 'in_flight'
+	| 'waiting_evidence'
+	| 'blocked_merit'
+	| 'slot_contention'
+	| 'awaiting_operator'
+	| 'live'
+	| 'parked'
+	| 'unknown';
+
+export interface PipelineExplainStrategy {
+	id: string;
+	display_id: string | null;
+	name: string;
+	symbol: string | null;
+	timeframe: string | null;
+	type: string | null;
+	stage: string;
+	stage_label: string;
+	stage_changed_at: string | null;
+	days_in_stage: number | null;
+	demotion_count: number | null;
+	status: PipelineExplainStatus | string;
+	promotable: boolean | null;
+	gate_reason: string | null;
+	blockers: PipelineExplainBlocker[];
+	next_action: PipelineExplainAction | null;
+	next_transition: PipelineExplainTransition | null;
+	evidence: PipelineExplainEvidence;
+	readiness_steps: ReadinessStep[];
+	gauntlet: {
+		workflow_status: string | null;
+		current_step: string | null;
+		required_tests: string[] | null;
+		missing_required: string[] | null;
+		tests_passed: number | null;
+		tests_total: number | null;
+		composite_robustness_score: number | null;
+		min_robustness_score: number | null;
+	} | null;
+	pending_approval: {
+		id: number;
+		approval_type: string | null;
+		requested_status: string | null;
+		reason: string | null;
+		at: string | null;
+	} | null;
+	last_rejection: {
+		gate: string | null;
+		reason_code: string | null;
+		reason_text: string | null;
+		at: string | null;
+		age_days: number | null;
+	} | null;
+	rejections_in_stage: number;
+}
+
+export interface PipelineExplainResponse {
+	ok: boolean;
+	generated_at: string;
+	pipeline_preset: string;
+	stages: string[];
+	counts: { by_stage: Record<string, number>; by_status: Record<string, number> };
+	truncated: boolean;
+	strategies: PipelineExplainStrategy[];
+	errors: Array<{ id: string | null; error: string }>;
+}
+
+/** Fleet-wide "why is every strategy where it is" — read-only on the backend. */
+export async function explainPipeline(opts?: { stage?: string; limit?: number }): Promise<PipelineExplainResponse> {
+	const p = new URLSearchParams();
+	if (opts?.stage) p.set('stage', opts.stage);
+	if (opts?.limit !== undefined) p.set('limit', String(opts.limit));
+	const query = p.toString();
+	return fetchApi(`/lifecycle/pipeline/explain${query ? `?${query}` : ''}`);
+}
+
+export async function explainStrategy(strategyId: string): Promise<{ ok: boolean; generated_at?: string; strategy?: PipelineExplainStrategy; error?: string }> {
+	return fetchApi(`/lifecycle/strategies/${encodeURIComponent(strategyId)}/explain`);
+}
+
 export type GauntletTestKey = 'walk_forward' | 'monte_carlo' | 'parameter_jitter' | 'cost_stress' | 'regime_split';
 
 export interface GauntletTestEntry {

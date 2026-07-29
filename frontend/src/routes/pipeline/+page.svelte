@@ -15,8 +15,9 @@
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import { fetchApi } from '$lib/api/core';
+	import PipelineExplainBoard from '$lib/components/lifecycle/PipelineExplainBoard.svelte';
 
-	type PipelineTab = 'pipeline' | 'code-review';
+	type PipelineTab = 'strategies' | 'pipeline' | 'code-review';
 
 	let recentJobs: Job[] = [];
 	let runningJobs: Job[] = [];
@@ -25,7 +26,7 @@
 	let loading = true;
 	let error: string | null = null;
 
-	let activeTab: PipelineTab = ($page.url.searchParams.get('tab') as PipelineTab) || 'pipeline';
+	let activeTab: PipelineTab = ($page.url.searchParams.get('tab') as PipelineTab) || 'strategies';
 	let codeReviewLog: Array<{ message: string; created_at: string; detail: Record<string, unknown> }> = [];
 	let codeReviewLoading = false;
 	let codeReviewError: string | null = null;
@@ -200,10 +201,11 @@
 		<div class="flex items-center gap-4">
 			<div>
 				<h1 class="text-lg font-bold uppercase tracking-widest text-white">Pipeline</h1>
-				<p class="text-xs text-[#666] mt-1">Background processes, scheduler jobs, and autopilot status.</p>
+				<p class="text-xs text-[#666] mt-1">Strategy funnel, background processes, scheduler jobs, and autopilot status.</p>
 			</div>
 			<div class="flex bg-[#111] border border-[#222] p-0.5 ml-4">
-				<button class="px-3 py-1 text-xs {activeTab === 'pipeline' ? 'bg-[#333] text-white' : 'text-[#888] hover:text-white'}" on:click={() => selectTab('pipeline')}>Pipeline</button>
+				<button class="px-3 py-1 text-xs {activeTab === 'strategies' ? 'bg-[#333] text-white' : 'text-[#888] hover:text-white'}" on:click={() => selectTab('strategies')} data-testid="pipeline-tab-strategies">Strategies</button>
+				<button class="px-3 py-1 text-xs {activeTab === 'pipeline' ? 'bg-[#333] text-white' : 'text-[#888] hover:text-white'}" on:click={() => selectTab('pipeline')}>Processes</button>
 				<button class="px-3 py-1 text-xs {activeTab === 'code-review' ? 'bg-[#333] text-white' : 'text-[#888] hover:text-white'}" on:click={() => selectTab('code-review')}>Code Review</button>
 			</div>
 		</div>
@@ -250,6 +252,9 @@
 				</div>
 			{/if}
 		</div>
+	{:else if activeTab === 'strategies'}
+		<!-- Strategy funnel: why each strategy is where it is, what unblocks it -->
+		<PipelineExplainBoard />
 	{:else}
 
 	{#if error}
