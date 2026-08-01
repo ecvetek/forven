@@ -34,6 +34,18 @@ class FakePropr:
     def normalize_asset(self, asset):
         return str(asset or "").upper()
 
+    def position_side(self, position):
+        # Mirrors forven.exchange.propr.position_side: explicit side wins,
+        # else the sign of the quantity decides.
+        side = str(position.get("positionSide") or position.get("side") or "").strip().lower()
+        if side in ("long", "short"):
+            return side
+        try:
+            qty = float(position.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        return "long" if qty >= 0 else "short"
+
     def raw_positions(self):
         if isinstance(self.positions, Exception):
             raise self.positions
@@ -220,6 +232,36 @@ def test_reappearing_leg_resets_the_missing_counter(forven_db):
 
     assert state["E1"]["status"] == "open"
     assert "venue_missing_ticks" not in state["E1"]
+
+
+def test_sideless_venue_long_backs_a_tracked_long(forven_db):
+    """Codex P1 on #113: a venue row with no side field must be sided by its
+    quantity sign, not defaulted — misreading a real long as short would
+    retire the tracked leg and cancel its live brackets."""
+    propr = FakePropr(positions=[{"asset": "ETH", "quantity": "0.29"}])
+    state = {"E1": {"status": "open", "asset": "ETH", "direction": "long",
+                    "stop_order_id": "o-stop"}}
+
+    for _ in range(pm._VENUE_MISSING_TICKS + 1):
+        pm._reconcile_unmanaged_positions(propr, state, NOW, {})
+
+    assert state["E1"]["status"] == "open"
+    assert "venue_missing_ticks" not in state["E1"]
+    assert propr.cancelled == []
+
+
+def test_sideless_venue_short_blocks_an_opposite_open(forven_db, monkeypatch):
+    """Same inference on the netting gate: negative quantity = short, so a
+    long open against it is deferred."""
+    monkeypatch.setattr(pm, "mirror_roster", lambda: {"S1": "t"})
+    propr = FakePropr(positions=[{"asset": "ETH", "quantity": "-0.5"}])
+
+    state: dict = {}
+    pm._mirror_open(propr, _row(direction="long"), state, 5000.0, NOW)
+
+    assert state["T1"]["status"] == "pending"
+    assert "netting conflict" in state["T1"]["reason"]
+    assert propr.orders == []
 
 
 def test_venue_read_failure_never_counts_as_missing(forven_db):

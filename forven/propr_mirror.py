@@ -640,13 +640,18 @@ def _position_key(propr, asset, direction) -> tuple[str, str]:
 
 
 def _venue_position_keys(propr, positions) -> set[tuple[str, str]]:
+    """(asset, side) for every venue position row, sided by the ADAPTER's
+    quantity-aware ``position_side`` — a payload with a missing or
+    unrecognized side field must never misclassify a real long as short
+    (Codex P1 on #113: that would retire the tracked leg and cancel its
+    live brackets)."""
     keys: set[tuple[str, str]] = set()
     for pos in positions or []:
         if not isinstance(pos, dict):
             continue
         asset = propr.normalize_asset(str(pos.get("asset") or pos.get("coin") or ""))
         if asset:
-            keys.add(_position_key(propr, asset, pos.get("positionSide") or pos.get("side")))
+            keys.add((asset, propr.position_side(pos)))
     return keys
 
 
@@ -1076,8 +1081,7 @@ def _reconcile_unmanaged_positions(propr, state: dict, now: datetime, summary: d
         if not isinstance(pos, dict):
             continue
         asset = propr.normalize_asset(str(pos.get("asset") or pos.get("coin") or ""))
-        side = str(pos.get("positionSide") or pos.get("side") or "").strip().lower()
-        side = "long" if side not in ("long", "short") else side
+        side = propr.position_side(pos)
         if not asset or (asset, side) in tracked:
             continue
         unmanaged[f"{asset}:{side}"] = {
