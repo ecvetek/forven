@@ -2875,6 +2875,15 @@ def _extract_reason_code(reason_text: str) -> str:
     # missing_evidence structurally; this protects historical prose-only DB rows.
     if "missing" in text and "verdict" in text:
         return "missing_evidence"
+    # No symbol assigned yet: the strategy is blank/GENERIC and has no backtest
+    # on a real pair to auto-resolve one from. Evidence-ABSENCE, not merit — the
+    # gate never judged an edge, it could not find a market to judge it on. This
+    # is the single most common state for a freshly authored strategy, so
+    # bucketing it as gate_reject told the operator to "revise or archive" a
+    # strategy whose only problem is that nobody has backtested it yet, AND fed
+    # the repeated-failure archive counter on a dry-run status poll.
+    if "no valid symbol" in text:
+        return "no_symbol_evidence"
     if "divergence" in text:
         return "source_divergence_reject"
     if "overfit" in text:
@@ -3070,6 +3079,10 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     # trades artifact was compacted, or no backtest row exists). Absence of the
     # measurement, not a bad measurement — re-running the backtest resolves it.
     "dsr_unavailable",
+    # Blank/GENERIC symbol with nothing to auto-assign from: the gate could not
+    # find a market to judge, so it never judged. Backtesting one real pair
+    # resolves it.
+    "no_symbol_evidence",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}

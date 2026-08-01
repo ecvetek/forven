@@ -303,6 +303,7 @@ def compute_strategy_dsr(
     *,
     default_trials: int | None = None,
     with_reason: bool = False,
+    dry_run: bool = False,
 ) -> dict | None:
     """Best-effort DSR for a strategy's latest backtest. Returns None on any issue.
 
@@ -441,9 +442,15 @@ def compute_strategy_dsr(
         # Write-through snapshot: list views display the last computed DSR
         # without ever paying this function's cost per row. Strategies whose
         # DSR was never computed have no value to show.
+        #
+        # STATUS-READONLY-1: skipped under dry_run. The DSR-FREEZE-1 note above
+        # froze this write for LOCKED stages after it silently re-scored a live
+        # strategy on a status read; an unlocked strategy read fleet-wide by a
+        # status/explain poll has the same problem, just without capital on it
+        # yet. The computed value is still returned — only the stamp is withheld.
         try:
             dsr_value = result.get("dsr")
-            if dsr_value is not None:
+            if dsr_value is not None and not dry_run:
                 from datetime import datetime, timezone
 
                 with get_db() as conn:

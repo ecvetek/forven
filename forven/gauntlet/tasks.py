@@ -2043,7 +2043,12 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
     if not strategy_id:
         return {"status": "blocked_runtime", "message": "workflow is missing strategy_id", "retryable": True}
 
-    status = get_strategy_gauntlet_status(strategy_id)
+    # STATUS-READONLY-1: the ONE caller that is not a read. This is the gate
+    # step itself, so the writes get_strategy_gauntlet_status can make —
+    # symbol auto-assignment, the DSR stamp, queueing a dethrone approval a
+    # challenger has earned — are the intended work here, not a side effect of
+    # someone looking at a page. Everything else takes the read-only default.
+    status = get_strategy_gauntlet_status(strategy_id, dry_run=False)
     if not status.get("ok"):
         return {"status": "blocked_runtime", "message": str(status.get("error") or "status unavailable"), "retryable": True}
 

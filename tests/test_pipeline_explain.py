@@ -180,6 +180,92 @@ def test_explain_is_read_only(forven_db):
         assert sym == "GENERIC", "dry_run must not auto-assign a symbol"
 
 
+def test_gauntlet_stage_explain_passes_dry_run_to_both_writers(forven_db, monkeypatch):
+    """STATUS-READONLY-1. test_explain_is_read_only above only exercises the
+    QUICK_SCREEN path, which already passed dry_run=True; the gauntlet branch
+    routes through get_strategy_gauntlet_status(), which called both writers at
+    their write-enabled defaults.
+
+    Asserted on the CALL rather than on the resulting rows on purpose. The two
+    writes need deep state to fire — auto_assign_best_symbol needs scored
+    backtest rows to have something to assign, compute_strategy_dsr needs a
+    trades artifact — so a row-level assertion on a light fixture passes whether
+    or not the bug is present, which is how this path went unguarded in the
+    first place. The contract that actually holds fleet-wide is that a status
+    read never asks for the write."""
+    import forven.gauntlet.deflated_sharpe as dsr_mod
+    import forven.policy as policy_mod
+
+    seen: list[tuple[str, object]] = []
+
+    real_eval = policy_mod.evaluate_promotion
+
+    def _spy_eval(sid, frm, to, *, record_rejection=True, dry_run=False):
+        seen.append(("evaluate_promotion", dry_run))
+        return real_eval(sid, frm, to, record_rejection=record_rejection, dry_run=dry_run)
+
+    def _spy_dsr(sid, **kwargs):
+        seen.append(("compute_strategy_dsr", kwargs.get("dry_run", False)))
+        return None
+
+    monkeypatch.setattr(policy_mod, "evaluate_promotion", _spy_eval)
+    monkeypatch.setattr(dsr_mod, "compute_strategy_dsr", _spy_dsr)
+
+    with get_db() as conn:
+        _insert_strategy(
+            conn, "s-g-nosym", "gauntlet",
+            symbol="GENERIC", metrics={"sharpe": 1.2, "total_trades": 40},
+        )
+
+    explain_strategy("s-g-nosym")
+
+    assert ("compute_strategy_dsr", True) in seen, seen
+    assert ("evaluate_promotion", True) in seen, seen
+    assert all(dry is True for _name, dry in seen), f"a status read asked for a write: {seen}"
+
+
+def test_gauntlet_status_defaults_to_read_only(forven_db):
+    """The default itself is the fix: every caller but the gate step is a read,
+    so the safe value has to be what you get for free."""
+    import inspect
+
+    from forven.gauntlet.status import get_strategy_gauntlet_status
+
+    assert inspect.signature(get_strategy_gauntlet_status).parameters["dry_run"].default is True
+
+
+def test_pending_approval_outranks_live_and_ready():
+    """APPROVAL-FIRST-1: an approval is the one state blocked on the operator,
+    so neither a live stage nor a still-promotable gate may hide it."""
+    from forven.pipeline_explain import _classify_status
+
+    approval = {"id": 7, "approval_type": "strategy_dethrone_recommendation"}
+
+    assert _classify_status("live_graduated", False, [], approval, False) == "awaiting_operator"
+    assert _classify_status("gauntlet", True, [], approval, False) == "awaiting_operator"
+    # Without one, the old precedence still holds.
+    assert _classify_status("live_graduated", False, [], None, False) == "live"
+    assert _classify_status("gauntlet", True, [], None, False) == "ready"
+
+
+def test_missing_symbol_is_absent_evidence_not_a_merit_failure():
+    """A blank strategy nobody has backtested was bucketed as gate_reject, so
+    the board told the operator to revise or archive it — and it fed the
+    repeated-failure archive counter."""
+    from forven.pipeline_explain import _classify_gate_reason
+    from forven.policy import _EVIDENCE_ABSENCE_REASON_CODES, classify_rejection_reason
+
+    reason = "No valid symbol — run backtests on at least one trading pair"
+    code, kind = classify_rejection_reason(reason)
+    assert code == "no_symbol_evidence"
+    assert kind == "evidence"
+    assert code in _EVIDENCE_ABSENCE_REASON_CODES
+
+    _code, _kind, action = _classify_gate_reason(reason)
+    # Absence, but the operator still has to act — not the "wait" default.
+    assert action[0] == "run_backtest"
+
+
 def test_evaluate_promotion_dry_run_missing_symbol(forven_db):
     with get_db() as conn:
         _insert_strategy(conn, "s-nosym", "quick_screen", symbol="GENERIC")

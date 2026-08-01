@@ -101,6 +101,9 @@ _REASON_CODE_ACTIONS = {
     "zero_trade": ("review_strategy", "Strategy produces no signals — revise the entry logic or archive it"),
     "duplicate_reject": ("review_slot", "Duplicates an active strategy on the same market — await the dethrone or retarget"),
     "not_found": ("review_strategy", "Strategy record is incomplete — investigate"),
+    # Absence, but NOT the "wait" default the other absence codes take: nothing
+    # resolves this on its own. The operator has to backtest one real pair.
+    "no_symbol_evidence": ("run_backtest", "No market assigned — backtest it on a real trading pair to assign one"),
 }
 _SLOT_ACTION = ("review_slot", "Slot occupied by an incumbent — resolve the pending dethrone or retarget the market")
 _DEFAULT_MERIT_ACTION = ("review_strategy", "Failed a quality gate on merit — revise parameters, re-optimize, or archive")
@@ -309,14 +312,28 @@ def _classify_status(
     pending_approval: dict | None,
     in_flight: bool,
 ) -> str:
+    # APPROVAL-FIRST-1: a queued approval outranks every other classification,
+    # because it is the only state that is definitionally blocked ON THE
+    # OPERATOR. It used to sit below both branches that could hide it:
+    #   * stage == live_graduated returned "live", so a dethrone or demotion
+    #     approval — the kind that reallocates LIVE capital — showed up as a
+    #     healthy live card and the operator had to expand it by hand to find
+    #     a decision waiting on them.
+    #   * promotable returned "ready", but queueing the approval is exactly
+    #     what leaves the strategy in its source stage, so the next dry-run
+    #     evaluation still reports promotable=True. The board therefore said
+    #     READY — "go press promote" — for a strategy whose promotion was
+    #     already queued and waiting on a signature.
+    # Both made the summary counts under-report NEEDS YOU, which is the one
+    # number this board exists to get right.
+    if pending_approval:
+        return "awaiting_operator"
     if stage == "live_graduated":
         return "live"
     if stage == "research_only":
         return "parked"
     if promotable:
         return "ready"
-    if pending_approval:
-        return "awaiting_operator"
     if any(b.get("kind") == "contention" for b in blockers):
         return "slot_contention"
     if in_flight or any(b.get("code") == "validation_in_flight" for b in blockers):
@@ -447,7 +464,11 @@ def _explain_row(row: dict, now: datetime) -> dict:
     status = _classify_status(stage, promotable, blockers, pending_approval, in_flight)
 
     next_action = None
-    if pending_approval and stage != "live_graduated":
+    # APPROVAL-FIRST-1: the live_graduated exclusion here suppressed the review
+    # action for precisely the approvals that matter most — a dethrone or
+    # demotion against a live incumbent. If an approval is queued, the action is
+    # to review it, whatever stage the strategy is in.
+    if pending_approval:
         next_action = _action_payload(
             "review_approval",
             f"Review pending approval #{pending_approval['id']} ({pending_approval.get('approval_type') or 'approval'})",

@@ -193,7 +193,34 @@ def _strategy_row(strategy_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
+def get_strategy_gauntlet_status(strategy_id: str, *, dry_run: bool = True) -> dict[str, Any]:
+    """Gauntlet status for one strategy.
+
+    STATUS-READONLY-1: ``dry_run`` defaults to TRUE, i.e. this is a read.
+
+    That default is the fix, not a convenience. Every caller of this function
+    bar one is a read surface — two GET endpoints (routers/gauntlet.py,
+    routers/lifecycle.py), the assistant's read tool, and the pipeline-explain
+    board, which polls it for EVERY gauntlet strategy in the fleet on every
+    refresh. Yet the two gates below both write when left at their own defaults:
+    compute_strategy_dsr() stamps strategies.deflated_sharpe, and
+    evaluate_promotion() auto-assigns a symbol/timeframe for a blank/GENERIC
+    strategy and QUEUES A DETHRONE APPROVAL against a live incumbent a
+    challenger beats. So opening a status view could reassign a strategy's
+    trading pair and file a request to demote live capital.
+
+    policy.evaluate_promotion states the rule this restores: "Read-only
+    status/explain surfaces that may be polled fleet-wide must use it — a poll
+    must never mutate pipeline state." Defaulting to dry_run makes every read
+    caller correct without each having to remember, and leaves exactly one
+    caller — run_paper_promotion_gate, the actual gate step — to opt IN with
+    dry_run=False. Getting that wrong now fails toward not writing.
+
+    DSR-FREEZE-1 already froze this write-through for locked (paper/live)
+    stages after a live strategy's headline DSR flipped 0.46 -> 0.01 on a
+    status read (S06325, 2026-07-21). This closes the same hole for the
+    unlocked stages that freeze deliberately leaves computable.
+    """
     clean_strategy_id = str(strategy_id or "").strip()
     if not clean_strategy_id:
         return {"ok": False, "error": "strategy_id_required", "strategy_id": strategy_id}
@@ -378,7 +405,7 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
     try:
         from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
 
-        deflated_sharpe = compute_strategy_dsr(clean_strategy_id)
+        deflated_sharpe = compute_strategy_dsr(clean_strategy_id, dry_run=dry_run)
     except Exception:
         deflated_sharpe = None
 
@@ -393,6 +420,7 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
                 "gauntlet",
                 "paper",
                 record_rejection=False,
+                dry_run=dry_run,
             )
         except Exception as exc:
             promotion_reason = f"Promotion gate unavailable: {exc}"
