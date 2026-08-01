@@ -224,6 +224,48 @@ def test_gauntlet_stage_explain_passes_dry_run_to_both_writers(forven_db, monkey
     assert all(dry is True for _name, dry in seen), f"a status read asked for a write: {seen}"
 
 
+def test_dry_run_reaches_the_dsr_gate_inside_the_gauntlet_evaluator(forven_db, monkeypatch):
+    """STATUS-READONLY-1, second route. evaluate_promotion(dry_run=True) promises
+    NO writes, but it dispatches to _evaluate_gauntlet_gate, which called
+    compute_strategy_dsr at its write-enabled default — so an ENABLED DSR gate
+    re-stamped strategies.deflated_sharpe on a read of any unlocked gauntlet
+    strategy even though the caller asked for a dry run. _evaluate_paper_gate
+    already took the flag; this one was the asymmetry."""
+    import inspect
+
+    import forven.policy as policy_mod
+
+    # Leg 1 (behavioural): evaluate_promotion must hand the flag to the gauntlet
+    # gate the way it already does to _evaluate_paper_gate.
+    seen: list[object] = []
+    real_gate = policy_mod._evaluate_gauntlet_gate
+
+    def _spy_gate(sid, config, *, dry_run=False):
+        seen.append(dry_run)
+        return (False, "spy")
+
+    monkeypatch.setattr(policy_mod, "_evaluate_gauntlet_gate", _spy_gate)
+
+    with get_db() as conn:
+        _insert_strategy(conn, "s-dsr-gate", "gauntlet", metrics={"sharpe": 1.4, "total_trades": 60})
+
+    policy_mod.evaluate_promotion(
+        "s-dsr-gate", "gauntlet", "paper", record_rejection=False, dry_run=True
+    )
+    assert seen == [True], f"dry_run did not reach the gauntlet gate: {seen}"
+
+    # Leg 2 (source): and the gate must hand it to compute_strategy_dsr. Asserted
+    # on the source because the DSR block sits behind the full gauntlet gate —
+    # every prior check has to pass to reach it, so a fixture light enough to be
+    # readable never gets there and the assertion silently proves nothing. That
+    # exact failure is what let this second write survive the first fix.
+    src = inspect.getsource(real_gate)
+    assert "compute_strategy_dsr(strategy_id, with_reason=True, dry_run=dry_run)" in src, (
+        "the gauntlet gate's DSR call dropped dry_run — it writes "
+        "strategies.deflated_sharpe, so a status read would mutate again"
+    )
+
+
 def test_gauntlet_status_defaults_to_read_only(forven_db):
     """The default itself is the fix: every caller but the gate step is a read,
     so the safe value has to be what you get for free."""
@@ -264,6 +306,39 @@ def test_missing_symbol_is_absent_evidence_not_a_merit_failure():
     _code, _kind, action = _classify_gate_reason(reason)
     # Absence, but the operator still has to act — not the "wait" default.
     assert action[0] == "run_backtest"
+
+
+def test_evidence_recency_skips_rows_that_measured_nothing(forven_db):
+    """A pending/errored run still lands in backtest_results with a fresh
+    created_at. Reporting it as evidence recency told the operator the strategy
+    had just been optimized while the gate was still reading weeks-old completed
+    evidence."""
+    from forven.pipeline_explain import _latest_result_times
+
+    with get_db() as conn:
+        _insert_strategy(conn, "s-ev", "gauntlet")
+        for rid, days, metrics in (
+            ("r-good", 12.0, {"sharpe": 1.1}),
+            ("r-errored", 1.0, {"status": "error", "error": "worker died"}),
+        ):
+            conn.execute(
+                "INSERT INTO backtest_results (result_id, strategy_id, result_type, "
+                "metrics_json, created_at) VALUES (?, ?, 'optimization', ?, ?)",
+                (rid, "s-ev", json.dumps(metrics), _iso_days_ago(days)),
+            )
+
+    latest = _latest_result_times("s-ev")
+    assert latest["optimization"]["result_id"] == "r-good", (
+        "an errored run is not evidence that anything was measured"
+    )
+
+
+def test_unavailable_dsr_asks_for_a_backtest_not_an_optimization(forven_db):
+    """Every dsr_unavailable path is an absent per-TRADE return series, which
+    only a backtest restores — re-optimizing cannot unblock it."""
+    from forven.pipeline_explain import _REASON_CODE_ACTIONS
+
+    assert _REASON_CODE_ACTIONS["dsr_unavailable"][0] == "run_backtest"
 
 
 def test_last_paper_trade_ignores_rows_the_gate_would_not_count(forven_db):

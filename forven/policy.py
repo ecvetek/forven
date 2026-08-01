@@ -2800,7 +2800,7 @@ def evaluate_promotion(
                             f"Slot occupied by incumbent {occ['id']} "
                             f"(same {my_symbol} {my_timeframe}) — awaiting dethrone"
                         )
-        result = _evaluate_gauntlet_gate(strategy_id, config)
+        result = _evaluate_gauntlet_gate(strategy_id, config, dry_run=dry_run)
         if record_rejection and not result[0]:
             _log_gate_rejection_record(strategy_id, "gauntlet", result[1], config)
         return result
@@ -4298,7 +4298,7 @@ _PAPER_GATE_FLOORS = {
 }
 
 
-def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
+def _evaluate_gauntlet_gate(strategy_id: str, config: dict, *, dry_run: bool = False) -> tuple[bool, str]:
     """Step 2 -> Step 3 gate: require robustness gauntlet score and S00552 test evidence.
     
     S00552 GAUNTLET GUARDRAILS:
@@ -4579,7 +4579,14 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
         try:
             from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
 
-            dsr_info = compute_strategy_dsr(strategy_id, with_reason=True)
+            # STATUS-READONLY-1: the SECOND route into the DSR write-through, and
+            # the one that survived the first pass at this. evaluate_promotion's
+            # dry_run contract ("guarantees NO writes") has to hold through every
+            # gate it dispatches to — _evaluate_paper_gate already took the flag,
+            # this one did not, so an enabled DSR gate re-stamped
+            # strategies.deflated_sharpe on a read of any unlocked gauntlet
+            # strategy even after the caller asked for a dry run.
+            dsr_info = compute_strategy_dsr(strategy_id, with_reason=True, dry_run=dry_run)
         except Exception as exc:
             return False, f"DSR gate unavailable: {exc}"
         dsr_val = dsr_info.get("dsr") if isinstance(dsr_info, dict) else None

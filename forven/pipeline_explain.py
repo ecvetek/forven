@@ -96,7 +96,13 @@ _REASON_CODE_ACTIONS = {
     "wfa_window_insufficient": ("run_validation_suite", "Re-run walk-forward with a window sized to the strategy's trade cadence"),
     "insufficient_paper_evidence": ("wait", "Keep paper trading — forward evidence is still accumulating"),
     "source_reconciliation_pending": ("wait", "Source reconciliation has not measured this pair yet — it runs on schedule"),
-    "dsr_unavailable": ("run_optimization", "Deflated-Sharpe inputs are missing — re-run optimization so trial counts are stamped"),
+    # Optimization does NOT restore what a blocked DSR is missing. Every way this
+    # code blocks (no_backtest_result / no_trades_in_artifact /
+    # insufficient_trade_returns) is an absent or compacted per-TRADE return
+    # series, and compute_strategy_dsr already falls back to a default trial
+    # count when no optimization row exists. The gate's own text asks for a
+    # backtest rerun; sending the operator to re-optimize cannot unblock it.
+    "dsr_unavailable": ("run_backtest", "Deflated-Sharpe inputs are missing — re-run the backtest to restore the per-trade returns"),
     "source_divergence_reject": ("fix_data", "Validation data diverges from the venue — backfill/reconcile data, then re-test"),
     "zero_trade": ("review_strategy", "Strategy produces no signals — revise the entry logic or archive it"),
     "duplicate_reject": ("review_slot", "Duplicates an active strategy on the same market — await the dethrone or retarget"),
@@ -171,20 +177,50 @@ def _classify_gate_reason(reason: str) -> tuple[str, str, tuple[str, str]]:
 
 
 def _latest_result_times(strategy_id: str) -> dict[str, dict]:
-    """Newest non-deleted backtest and optimization rows (evidence recency)."""
+    """Newest backtest/optimization rows that actually MEASURED something.
+
+    A pending, errored, timed-out or restart-killed row still lands in
+    backtest_results with a fresh created_at. Taking the newest row outright
+    reported "optimized today" while the gate was still reading completed
+    evidence from weeks ago — the board would say the strategy had just been
+    worked on when nothing had actually run. policy._latest_genuine_result_time
+    skips those rows for exactly this reason; is_nonresult_validation_row is the
+    shared predicate, so the recency readout and the gate agree on what counts.
+    """
+    from forven.policy import is_nonresult_validation_row
+
     out: dict[str, dict] = {}
     with get_db() as conn:
         for result_type in ("backtest", "optimization"):
-            row = conn.execute(
-                """SELECT result_id, created_at FROM backtest_results
+            rows = conn.execute(
+                """SELECT result_id, created_at,
+                          CASE WHEN json_valid(COALESCE(metrics_json, ''))
+                               THEN LOWER(TRIM(COALESCE(json_extract(metrics_json, '$.status'), '')))
+                               ELSE '' END AS m_status,
+                          CASE WHEN json_valid(COALESCE(metrics_json, ''))
+                               THEN TRIM(COALESCE(json_extract(metrics_json, '$.error'), ''))
+                               ELSE '' END AS m_error,
+                          CASE WHEN json_valid(COALESCE(config_json, ''))
+                               THEN LOWER(TRIM(COALESCE(json_extract(config_json, '$.status'), '')))
+                               ELSE '' END AS c_status,
+                          CASE WHEN json_valid(COALESCE(config_json, ''))
+                               THEN TRIM(COALESCE(json_extract(config_json, '$.error'), ''))
+                               ELSE '' END AS c_error
+                   FROM backtest_results
                    WHERE strategy_id = ?
                      AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
                      AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
-                   ORDER BY datetime(created_at) DESC LIMIT 1""",
+                   ORDER BY datetime(created_at) DESC""",
                 (strategy_id, result_type),
-            ).fetchone()
-            if row:
+            ).fetchall()
+            for row in rows:
+                if is_nonresult_validation_row(
+                    {"status": row["m_status"], "error": row["m_error"]},
+                    {"status": row["c_status"], "error": row["c_error"]},
+                ):
+                    continue
                 out[result_type] = {"result_id": row["result_id"], "at": row["created_at"]}
+                break
     return out
 
 
