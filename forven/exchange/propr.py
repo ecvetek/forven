@@ -1206,7 +1206,12 @@ def close_position(
     try:
         created = _create_orders(account_id, [order])
     except ProprApiError as exc:
-        return {"error": f"Propr close rejected: {exc}"}
+        # Surface the venue's numeric error code structurally — callers that
+        # must branch on a specific reject (e.g. the mirror treating 13065
+        # position_not_found_or_not_open as already-flat) get the code, not a
+        # string to parse.
+        code = exc.payload.get("code") if isinstance(exc.payload, dict) else None
+        return {"error": f"Propr close rejected: {exc}", "error_code": code}
     row = created[0] if created else {}
     order_id = _order_id(row)
     if order_id is None:
