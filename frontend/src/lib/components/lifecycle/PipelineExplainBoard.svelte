@@ -98,6 +98,26 @@
 			</span>
 		</div>
 
+		<!--
+			explain_pipeline() drops any strategy whose row build raised and reports
+			it in data.errors rather than blanking the fleet. Without this the card
+			just vanishes and every count above silently under-reports — a board
+			that quietly shows you less than the truth is worse than one that admits
+			it is incomplete.
+		-->
+		{#if data.errors?.length}
+			<div
+				class="border border-red-900 bg-red-500/5 px-3 py-2 text-[11px] text-red-400"
+				data-testid="explain-errors"
+			>
+				<span class="font-bold uppercase tracking-wider">Incomplete view</span> —
+				{data.errors.length}
+				{data.errors.length === 1 ? 'strategy' : 'strategies'} could not be explained and
+				{data.errors.length === 1 ? 'is' : 'are'} missing from the board and from the counts above:
+				<span class="text-red-300">{data.errors.map((e) => e.id ?? '?').join(', ')}</span>
+			</div>
+		{/if}
+
 		<!-- Stage columns -->
 		<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
 			{#each STAGE_ORDER as stage}
