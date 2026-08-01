@@ -238,6 +238,20 @@ def _pending_approval(strategy_id: str) -> dict | None:
 
 
 def _last_paper_trade_at(strategy_id: str, since: str | None) -> str | None:
+    """Newest paper close that the paper->live gate would actually COUNT.
+
+    The eligibility predicates are not decoration. This value is rendered as the
+    strategy's forward-evidence recency, and the operator reads it to decide
+    whether a warm-up is progressing or stalled. Counting every closed paper row
+    — legacy and manual closes with no pnl_pct, rows without the parity stamp —
+    dated the evidence from today while the newest row the gate accepts could be
+    weeks older, which reads as "nearly there" on a strategy that has not moved.
+    _check_paper_trades and the gate itself both apply pnl_pct IS NOT NULL and
+    _PARITY_PNL_FILTER; a recency readout of gate evidence has to agree with the
+    gate, so it borrows the same filter rather than restating it.
+    """
+    from forven.policy import _PARITY_PNL_FILTER
+
     params: list[object] = [strategy_id]
     where_since = ""
     if since:
@@ -248,7 +262,8 @@ def _last_paper_trade_at(strategy_id: str, since: str | None) -> str | None:
             "SELECT MAX(datetime(closed_at)) AS last_at FROM trades "
             "WHERE COALESCE(strategy_id, strategy) = ? "
             "AND status = 'CLOSED' "
-            "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'" + where_since,
+            "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%' "
+            "AND pnl_pct IS NOT NULL" + _PARITY_PNL_FILTER + where_since,
             tuple(params),
         ).fetchone()
     return row["last_at"] if row and row["last_at"] else None

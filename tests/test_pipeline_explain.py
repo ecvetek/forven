@@ -266,6 +266,33 @@ def test_missing_symbol_is_absent_evidence_not_a_merit_failure():
     assert action[0] == "run_backtest"
 
 
+def test_last_paper_trade_ignores_rows_the_gate_would_not_count(forven_db):
+    """Evidence recency has to agree with the gate that judges the evidence. A
+    legacy/manual close with no pnl_pct, or one missing the parity stamp, is not
+    promotion evidence — dating the warm-up from it reads as "nearly there" on a
+    strategy the gate has not seen move in weeks."""
+    from forven.pipeline_explain import _last_paper_trade_at
+
+    with get_db() as conn:
+        _insert_strategy(conn, "s-paper-age", "paper")
+        for tid, days, pnl, signal in (
+            ("t-ok", 9.0, 0.01, json.dumps({"pnl_is_equity_fraction": 1})),
+            ("t-no-pnl", 1.0, None, json.dumps({"pnl_is_equity_fraction": 1})),
+            ("t-no-parity", 2.0, 0.01, json.dumps({})),
+        ):
+            conn.execute(
+                "INSERT INTO trades (id, strategy_id, strategy, asset, direction, status, "
+                "execution_type, pnl_pct, signal_data, closed_at) "
+                "VALUES (?, ?, ?, 'BTC', 'long', 'CLOSED', 'paper', ?, ?, ?)",
+                (tid, "s-paper-age", "s-paper-age", pnl, signal, _iso_days_ago(days)),
+            )
+
+    last = _last_paper_trade_at("s-paper-age", None)
+    assert last is not None
+    # The 1- and 2-day-old rows are ineligible; the newest COUNTABLE close is 9d.
+    assert last.startswith(_iso_days_ago(9.0)[:10])
+
+
 def test_evaluate_promotion_dry_run_missing_symbol(forven_db):
     with get_db() as conn:
         _insert_strategy(conn, "s-nosym", "quick_screen", symbol="GENERIC")
