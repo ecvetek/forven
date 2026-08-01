@@ -2619,8 +2619,17 @@ def evaluate_promotion(
     to_stage: str,
     *,
     record_rejection: bool = True,
+    dry_run: bool = False,
 ) -> tuple[bool, str]:
-    """Single source of truth for all promotion decisions in the 4-step gauntlet."""
+    """Single source of truth for all promotion decisions in the 4-step gauntlet.
+
+    ``dry_run=True`` evaluates the exact same gates but guarantees NO writes:
+    no rejection records, no dethrone approvals, no symbol auto-assignment, no
+    graduation-baseline snapshot. Read-only status/explain surfaces that may be
+    polled fleet-wide must use it — a poll must never mutate pipeline state.
+    """
+    if dry_run:
+        record_rejection = False
     config = load_pipeline_config()
     normalized_from = _normalize_pipeline_stage(from_stage)
     normalized_to = _normalize_pipeline_stage(to_stage)
@@ -2671,6 +2680,8 @@ def evaluate_promotion(
             ).fetchone()
         current_sym = str((sym_row["symbol"] if sym_row else "") or "").strip().upper()
         if not current_sym or current_sym == "GENERIC":
+            if dry_run:
+                return False, "No valid symbol — run backtests on at least one trading pair"
             # Attempt auto-resolution from backtest results
             from forven.db import auto_assign_best_symbol
             assigned = auto_assign_best_symbol(strategy_id)
@@ -2740,7 +2751,8 @@ def evaluate_promotion(
                     beaten.append((live, incumbent_metrics))
                 else:
                     return False, f"Duplicate with active strategy {live['id']} (same {new_symbol} {new_timeframe})"
-            for live, incumbent_metrics in beaten:
+            # dry_run: same tournament verdict, but never queue/apply a dethrone.
+            for live, incumbent_metrics in [] if dry_run else beaten:
                 with get_db() as dconn:
                     approval_id = _queue_challenger_dethrone(
                         conn=dconn,
@@ -2788,12 +2800,12 @@ def evaluate_promotion(
                             f"Slot occupied by incumbent {occ['id']} "
                             f"(same {my_symbol} {my_timeframe}) — awaiting dethrone"
                         )
-        result = _evaluate_gauntlet_gate(strategy_id, config)
+        result = _evaluate_gauntlet_gate(strategy_id, config, dry_run=dry_run)
         if record_rejection and not result[0]:
             _log_gate_rejection_record(strategy_id, "gauntlet", result[1], config)
         return result
     if normalized_to == "live_graduated":
-        result = _evaluate_paper_gate(strategy_id, config)
+        result = _evaluate_paper_gate(strategy_id, config, dry_run=dry_run)
         if record_rejection and not result[0]:
             _log_gate_rejection_record(strategy_id, "paper", result[1], config)
         return result
@@ -2863,6 +2875,15 @@ def _extract_reason_code(reason_text: str) -> str:
     # missing_evidence structurally; this protects historical prose-only DB rows.
     if "missing" in text and "verdict" in text:
         return "missing_evidence"
+    # No symbol assigned yet: the strategy is blank/GENERIC and has no backtest
+    # on a real pair to auto-resolve one from. Evidence-ABSENCE, not merit — the
+    # gate never judged an edge, it could not find a market to judge it on. This
+    # is the single most common state for a freshly authored strategy, so
+    # bucketing it as gate_reject told the operator to "revise or archive" a
+    # strategy whose only problem is that nobody has backtested it yet, AND fed
+    # the repeated-failure archive counter on a dry-run status poll.
+    if "no valid symbol" in text:
+        return "no_symbol_evidence"
     if "divergence" in text:
         return "source_divergence_reject"
     if "overfit" in text:
@@ -2921,6 +2942,21 @@ def _resolve_reason_code(reason: str) -> str:
     if code:
         return code
     return _extract_reason_code(str(reason))
+
+
+def classify_rejection_reason(reason: str) -> tuple[str, str]:
+    """Public taxonomy view for read-only explain surfaces.
+
+    Returns ``(reason_code, kind)`` where kind is ``"evidence"`` — the rejection
+    is absence/staleness of evidence (tests not run yet, work in flight, stale
+    artifacts, paper warm-up) and resolves by producing evidence — or
+    ``"merit"`` — the strategy was measured and failed a quality bar. Same
+    classification the 5-strike auto-archive uses, so an explain surface never
+    tells the operator a warm-up wait is a quality failure (or vice versa).
+    """
+    code = _resolve_reason_code(reason)
+    kind = "evidence" if code in _EVIDENCE_ABSENCE_REASON_CODES else "merit"
+    return code, kind
 
 
 def _load_metrics_snapshot_for_rejection(strategy_id: str) -> dict | None:
@@ -3043,6 +3079,10 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     # trades artifact was compacted, or no backtest row exists). Absence of the
     # measurement, not a bad measurement — re-running the backtest resolves it.
     "dsr_unavailable",
+    # Blank/GENERIC symbol with nothing to auto-assign from: the gate could not
+    # find a market to judge, so it never judged. Backtesting one real pair
+    # resolves it.
+    "no_symbol_evidence",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}
@@ -4258,7 +4298,7 @@ _PAPER_GATE_FLOORS = {
 }
 
 
-def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
+def _evaluate_gauntlet_gate(strategy_id: str, config: dict, *, dry_run: bool = False) -> tuple[bool, str]:
     """Step 2 -> Step 3 gate: require robustness gauntlet score and S00552 test evidence.
     
     S00552 GAUNTLET GUARDRAILS:
@@ -4539,7 +4579,14 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
         try:
             from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
 
-            dsr_info = compute_strategy_dsr(strategy_id, with_reason=True)
+            # STATUS-READONLY-1: the SECOND route into the DSR write-through, and
+            # the one that survived the first pass at this. evaluate_promotion's
+            # dry_run contract ("guarantees NO writes") has to hold through every
+            # gate it dispatches to — _evaluate_paper_gate already took the flag,
+            # this one did not, so an enabled DSR gate re-stamped
+            # strategies.deflated_sharpe on a read of any unlocked gauntlet
+            # strategy even after the caller asked for a dry run.
+            dsr_info = compute_strategy_dsr(strategy_id, with_reason=True, dry_run=dry_run)
         except Exception as exc:
             return False, f"DSR gate unavailable: {exc}"
         dsr_val = dsr_info.get("dsr") if isinstance(dsr_info, dict) else None
@@ -4668,7 +4715,7 @@ def _snapshot_graduation_baseline(strategy_id: str, metrics: dict, paper_pnls: l
         log.warning("Failed to snapshot graduation baseline for %s: %s", strategy_id, exc)
 
 
-def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
+def _evaluate_paper_gate(strategy_id: str, config: dict, *, dry_run: bool = False) -> tuple[bool, str]:
     """Step 3 -> Step 4 gate: forward paper proof (duration, sample, return, drawdown).
 
     S00152 OVERFITTING GUARDRAILS (thresholds wired via paper_trading.* settings):
@@ -4885,7 +4932,8 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     allocation_cap = _resolve_live_allocation_pct(days_in_stage, config, strategy_id=strategy_id)
 
     # P4-4: Snapshot paper metrics at graduation for drift comparison
-    _snapshot_graduation_baseline(strategy_id, metrics, pnls)
+    if not dry_run:
+        _snapshot_graduation_baseline(strategy_id, metrics, pnls)
 
     # S00152: Apply PF-based position reduction if applicable
     if pf_position_reduction:

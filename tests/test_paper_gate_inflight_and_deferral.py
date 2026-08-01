@@ -225,7 +225,8 @@ def test_workflow_gate_maps_inflight_block_to_exempt_code(forven_db, monkeypatch
 
     monkeypatch.setattr(
         gstatus, "get_strategy_gauntlet_status",
-        lambda sid: {"ok": True, "missing_required": [], "tests": {}},
+        # STATUS-READONLY-1: gate step passes dry_run=False (see tasks.py).
+        lambda sid, *, dry_run=True: {"ok": True, "missing_required": [], "tests": {}},
     )
     monkeypatch.setattr(tasks, "_select_and_persist_execution_profile", lambda wf, sid: {"ok": True})
     monkeypatch.setattr(

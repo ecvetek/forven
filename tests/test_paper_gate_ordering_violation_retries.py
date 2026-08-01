@@ -26,7 +26,9 @@ def _patch_status_ok(monkeypatch):
     monkeypatch.setattr(
         gstatus,
         "get_strategy_gauntlet_status",
-        lambda sid: {"ok": True, "missing_required": []},
+        # STATUS-READONLY-1: the gate step is the one caller that opts IN to the
+        # writes, so the stub has to accept the kwarg it now passes.
+        lambda sid, *, dry_run=True: {"ok": True, "missing_required": []},
     )
 
 
