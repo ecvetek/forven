@@ -981,7 +981,11 @@ def _position_quantity(position: dict) -> float:
     return 0.0
 
 
-def _position_side(position: dict) -> str:
+def position_side(position: dict) -> str:
+    """The side of a venue position payload — public because every consumer of
+    ``raw_positions()`` rows must interpret them the SAME way. Falls back to
+    the sign of the quantity when ``positionSide``/``side`` is missing or
+    unrecognized (the venue's own convention: negative = short)."""
     side = str(position.get("positionSide") or position.get("side") or "").strip().lower()
     if side in ("long", "short"):
         return side
@@ -1074,7 +1078,7 @@ def _find_position(asset: str, position_direction: str) -> dict | None:
     for p in raw_positions():
         if normalize_asset(str(p.get("asset") or p.get("coin") or "")) != asset_n:
             continue
-        if _position_side(p) == want:
+        if position_side(p) == want:
             return p
     return None
 
@@ -1206,7 +1210,12 @@ def close_position(
     try:
         created = _create_orders(account_id, [order])
     except ProprApiError as exc:
-        return {"error": f"Propr close rejected: {exc}"}
+        # Surface the venue's numeric error code structurally — callers that
+        # must branch on a specific reject (e.g. the mirror treating 13065
+        # position_not_found_or_not_open as already-flat) get the code, not a
+        # string to parse.
+        code = exc.payload.get("code") if isinstance(exc.payload, dict) else None
+        return {"error": f"Propr close rejected: {exc}", "error_code": code}
     row = created[0] if created else {}
     order_id = _order_id(row)
     if order_id is None:

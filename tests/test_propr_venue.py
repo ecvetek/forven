@@ -309,6 +309,28 @@ def test_close_position_reaches_the_venue_after_conversion(monkeypatch):
     assert "reached the venue" in result["error"]
 
 
+def test_close_reject_surfaces_the_venue_error_code(monkeypatch):
+    """The mirror branches on 13065 position_not_found_or_not_open (already
+    flat — terminal on the first attempt), so the venue's numeric code must
+    arrive structurally, not embedded in an error string."""
+    propr = _converted_to_funded(monkeypatch)
+    monkeypatch.setattr(propr, "get_all_mids", lambda testnet=True: {"BTC": 50_000.0})
+    monkeypatch.setattr(propr, "_quantize_size", lambda asset, size: float(size))
+    monkeypatch.setattr(propr, "_round_price", lambda price, asset: float(price))
+
+    def _reject(account_id, orders, group_id=None):
+        raise propr.ProprApiError(
+            400, "POST /accounts/acct-1/orders: position_not_found_or_not_open",
+            {"message": "position_not_found_or_not_open", "code": 13065},
+        )
+
+    monkeypatch.setattr(propr, "_create_orders", _reject)
+
+    result = propr.close_position("BTC", 0.001, "sell")
+    assert result["error_code"] == 13065
+    assert "position_not_found_or_not_open" in result["error"]
+
+
 def test_protective_leg_reaches_the_venue_after_conversion(monkeypatch):
     """A stop can only ever be armed against an ALREADY-OPEN position, so it
     caps risk — losing the ability to place one is the opposite of safe."""
@@ -617,6 +639,24 @@ def mirror_env(forven_db, monkeypatch):
     monkeypatch.setattr(propr, "market_order", fake_market_order)
     monkeypatch.setattr(propr, "close_position", fake_close)
     monkeypatch.setattr(propr, "cancel_order", lambda *a, **k: {"cancelled": True})
+
+    # The venue book, derived from the fake fills above, so the PROPR-NET-1
+    # open gate and the PROPR-LEDGER-2 tracked-vs-venue reconcile see a venue
+    # consistent with what the mirror has placed (the real adapter would).
+    def fake_raw_positions():
+        open_qty: dict[tuple[str, str], float] = {}
+        for o in calls["orders"]:
+            key = (o["asset"], "long" if o["side"] == "buy" else "short")
+            open_qty[key] = open_qty.get(key, 0.0) + float(o["size"])
+        for c in calls["closes"]:
+            key = (c["asset"], "short" if c["side"] == "buy" else "long")
+            open_qty[key] = open_qty.get(key, 0.0) - float(c["size"])
+        return [
+            {"asset": asset, "positionSide": side, "quantity": qty}
+            for (asset, side), qty in open_qty.items() if abs(qty) > 1e-12
+        ]
+
+    monkeypatch.setattr(propr, "raw_positions", fake_raw_positions)
     return pm, calls
 
 

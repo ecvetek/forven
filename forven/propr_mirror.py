@@ -34,9 +34,16 @@ Semantics:
 * Idempotency — entry intentIds derive deterministically from the source
   trade id, so a re-tick after a lost state write cannot double-open; closes
   are reduceOnly, so a duplicate close is harmless by construction.
-* Propr merges same-asset/same-side positions into one; two roster strategies
-  long the same coin share a merged position, and each mirrored close reduces
-  it by that trade's own quantity.
+* Propr NETS one position per asset (verified 2026-07-31 against the live
+  order history — an earlier revision claimed same-side-only merging, which is
+  wrong): same-side entries merge into the netted position, and an
+  opposite-side entry REDUCES or FLIPS it — and the venue cancels every
+  resting protective stop when the position flips, leaving the book
+  unprotected. PROPR-NET-1: an open that would net against an opposite-side
+  leg (tracked here or live on the venue) is DEFERRED, not placed; it mirrors
+  normally if the opposite leg closes inside the freshness window and expires
+  to a stale skip past it. Same-side merging is unaffected: each mirrored
+  close still reduces the netted position by that trade's own quantity.
 
 Halts (two independent layers, both OPEN-only — closes are never blocked):
 * The GLOBAL trading halt (`risk.is_trading_allowed`: kill-switch / daily-loss
@@ -61,7 +68,10 @@ depend on it: mirrored opens are idempotent by intentId and closes are
 reduce-only, but a LOST state entry means nothing here will close that leg. The
 per-tick reconcile against `propr.raw_positions()` exists for exactly that gap
 — it reports venue positions with no open state entry (kv
-`forven:propr-mirror:unmanaged`) so an orphan is visible instead of silent.
+`forven:propr-mirror:unmanaged`) so an orphan is visible instead of silent, and
+it retires tracked legs whose venue position is GONE (PROPR-LEDGER-2, status
+``venue_missing``) so state cannot keep reporting exposure the venue no longer
+holds.
 Roster: kv `forven:settings` key `propr_mirror_strategies` {sid: added_iso},
 toggle `propr_mirror_enabled`. Managed ONLY via /api/propr/mirror (the generic
 settings PUT preserves unknown keys; nothing here is in the settings manifest).
@@ -136,6 +146,17 @@ MAX_OPENS_PER_TICK = 3
 MAX_OPEN_ATTEMPTS = 3
 MAX_CLOSE_ATTEMPTS = 10
 _STATE_RETENTION_DAYS = 7
+
+# The venue's "position_not_found_or_not_open" reject. On a reduce-only close
+# it means there is nothing left to reduce — the leg is already flat (its stop
+# filled first, or per-asset netting consumed it) — so retrying can never
+# succeed and the FIRST such reject is terminal.
+_PROPR_CODE_NO_POSITION = 13065
+
+# PROPR-LEDGER-2: consecutive venue reads a tracked-open leg must be absent
+# from before it is retired as ``venue_missing``. Hysteresis, not a delay knob:
+# one partial positions response must not retire a real leg.
+_VENUE_MISSING_TICKS = 3
 
 # RETRY-1: how fresh the scanner's signal snapshot must be to prove the entry
 # signal is still active (fail closed on a stale snapshot), and how long a
@@ -609,6 +630,64 @@ def _notify_mirror_failure(trade_id: str, entry: dict, kind: str) -> None:
         log.debug("Could not emit propr mirror failure notification: %s", exc)
 
 
+def _position_key(propr, asset, direction) -> tuple[str, str]:
+    """(normalized asset, long|short) — the identity Propr nets positions by."""
+    side = str(direction or "").strip().lower()
+    return (
+        propr.normalize_asset(str(asset or "")),
+        "long" if side == "long" else "short",
+    )
+
+
+def _venue_position_keys(propr, positions) -> set[tuple[str, str]]:
+    """(asset, side) for every venue position row, sided by the ADAPTER's
+    quantity-aware ``position_side`` — a payload with a missing or
+    unrecognized side field must never misclassify a real long as short
+    (Codex P1 on #113: that would retire the tracked leg and cancel its
+    live brackets)."""
+    keys: set[tuple[str, str]] = set()
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        asset = propr.normalize_asset(str(pos.get("asset") or pos.get("coin") or ""))
+        if asset:
+            keys.add((asset, propr.position_side(pos)))
+    return keys
+
+
+def _netting_conflict(propr, state: dict, trade_id: str, asset: str, direction: str) -> str | None:
+    """PROPR-NET-1: the reason this open must not be placed, else None.
+
+    Propr keeps ONE netted position per asset, so an opposite-side open is a
+    reduce/flip of an existing leg, not a new hedged position — and the venue
+    cancels every resting protective stop when the position flips (observed
+    2026-07-31: one entry flipped the ETH book long->short and Propr cancelled
+    all three resting ETH stops, leaving the exposure unprotected). Check both
+    this mirror's open legs and the venue book; an unreadable venue fails
+    CLOSED — an order that cannot be verified safe is not placed."""
+    opposite = ("short" if direction == "long" else "long")
+    for other_id, other in state.items():
+        if other_id == trade_id or not isinstance(other, dict):
+            continue
+        if other.get("status") != "open":
+            continue
+        if _position_key(propr, other.get("asset"), other.get("direction")) == (asset, opposite):
+            return (
+                f"netting conflict: mirrored trade {other_id} holds the opposite side of "
+                f"{asset} and Propr nets one position per asset"
+            )
+    try:
+        positions = propr.raw_positions() or []
+    except Exception as exc:
+        return f"venue positions unreadable ({exc}) — failing closed on the netting check"
+    if (asset, opposite) in _venue_position_keys(propr, positions):
+        return (
+            f"netting conflict: the venue already holds an opposite-side {asset} position "
+            "and Propr nets one position per asset"
+        )
+    return None
+
+
 def _record_open_error(trade_id: str, entry: dict, reason: str) -> None:
     """Bounded-retry bookkeeping for a failed open attempt; notifies once the
     failure turns terminal."""
@@ -650,6 +729,15 @@ def _mirror_open(
     # Price already through the stop => the trade is over before we arrived.
     if (direction == "long" and mid <= stop_price) or (direction == "short" and mid >= stop_price):
         entry.update({"status": "skipped", "reason": "price already beyond the stop at mirror time"})
+        return
+
+    # PROPR-NET-1: never place an open that would net against an opposite-side
+    # leg. Deferred (status pending), not skipped — it mirrors normally if the
+    # opposite leg closes inside the freshness window, and past the window the
+    # tick loop expires it to a stale skip like any other aged entry.
+    conflict = _netting_conflict(propr, state, trade_id, asset, direction)
+    if conflict:
+        entry.update({"status": "pending", "reason": f"deferred: {conflict}"})
         return
 
     # SLICE-1: size against this member's share of the challenge, not the whole
@@ -775,6 +863,20 @@ def _rearm_or_close_unprotected(
         entry["reason"] = f"unprotected and emergency close raised: {exc}"
 
 
+def _cancel_bracket_legs(propr, asset: str, entry: dict) -> None:
+    """Best-effort cancel of a retired leg's resting stop/TP orders.
+
+    The bracket legs are reduce-only so they can never re-open a position,
+    but cancel them anyway to keep the order book tidy."""
+    for leg_key in ("stop_order_id", "take_profit_order_id"):
+        leg_id = entry.get(leg_key)
+        if leg_id:
+            try:
+                propr.cancel_order(asset, leg_id)
+            except Exception as exc:
+                log.debug("Propr mirror: bracket cancel %s failed: %s", leg_id, exc)
+
+
 def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
     asset = propr.normalize_asset(str(entry.get("asset") or ""))
     direction = str(entry.get("direction") or "").strip().lower()
@@ -783,6 +885,31 @@ def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
         entry.update({"status": "closed", "reason": "nothing to close (zero mirrored quantity)"})
         return
     result = propr.close_position(asset, quantity, "sell" if direction == "long" else "buy")
+
+    # A no-position reject is terminal on the FIRST attempt: the venue has
+    # nothing this reduce-only close could reduce — the leg is already flat
+    # (its stop filled first, or per-asset netting consumed it) — and no
+    # number of retries changes that. Recorded as closed-at-venue, not
+    # alarmed as a failure: before this branch existed each such close burned
+    # MAX_CLOSE_ATTEMPTS rejects and a close_failed notification for a
+    # position that no longer existed.
+    if (
+        isinstance(result, dict)
+        and result.get("error")
+        and result.get("error_code") == _PROPR_CODE_NO_POSITION
+    ):
+        entry.update({
+            "status": "closed",
+            "reason": "venue reported no open position to reduce (13065) — already flat",
+            "venue_position_missing": True,
+            "closed_at": now.isoformat(),
+        })
+        _cancel_bracket_legs(propr, asset, entry)
+        log.warning(
+            "Propr mirror: close for trade %s found no venue position (13065) — "
+            "recording the leg as already closed", trade_id,
+        )
+        return
     # PROPR-CLOSE-1: gate the "closed" transition AND the bracket-leg cancels on
     # a fill that CONFIRMS THE WHOLE MIRRORED QUANTITY. Marking a close "closed"
     # retires the position from this ledger AND cancels its stop/TP — leaving a
@@ -818,15 +945,7 @@ def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
             "closed_quantity": filled,
             "closed_at": now.isoformat(),
         })
-        # The bracket legs are reduce-only so they can never re-open a
-        # position, but cancel them anyway to keep the order book tidy.
-        for leg_key in ("stop_order_id", "take_profit_order_id"):
-            leg_id = entry.get(leg_key)
-            if leg_id:
-                try:
-                    propr.cancel_order(asset, leg_id)
-                except Exception as exc:
-                    log.debug("Propr mirror: bracket cancel %s failed: %s", leg_id, exc)
+        _cancel_bracket_legs(propr, asset, entry)
         log.info("Propr mirror CLOSE %s %s for trade %s", asset, direction, trade_id)
     else:
         attempts = int(entry.get("close_attempts") or 0) + 1
@@ -863,6 +982,64 @@ def _mirror_close(propr, trade_id: str, entry: dict, now: datetime) -> None:
             _notify_mirror_failure(trade_id, entry, "close")
 
 
+def _retire_venue_missing_legs(propr, state: dict, venue_keys: set, now: datetime, summary: dict) -> None:
+    """PROPR-LEDGER-2: retire tracked-open legs whose venue position is GONE.
+
+    The reverse of the unmanaged report. Propr nets one position per asset, so
+    a leg this mirror tracks as open can be consumed venue-side (its stop
+    fills, or an opposite-side fill nets it away — observed 2026-07-31, where
+    a netted-away leg kept reporting "open" for days). Leaving it "open" keeps
+    phantom exposure on the page and burns MAX_CLOSE_ATTEMPTS rejected closes
+    when the source finally exits. A leg absent for _VENUE_MISSING_TICKS
+    consecutive successful reads is retired as ``venue_missing`` and notified
+    once; the hysteresis exists so one partial positions response cannot
+    retire a real leg, and a wrongly retired leg still surfaces through the
+    unmanaged report, so either failure mode stays visible."""
+    for trade_id, entry in state.items():
+        if not isinstance(entry, dict) or entry.get("status") != "open":
+            continue
+        key = _position_key(propr, entry.get("asset"), entry.get("direction"))
+        if not key[0] or key in venue_keys:
+            entry.pop("venue_missing_ticks", None)
+            continue
+        misses = int(entry.get("venue_missing_ticks") or 0) + 1
+        entry["venue_missing_ticks"] = misses
+        if misses < _VENUE_MISSING_TICKS:
+            continue
+        entry.update({
+            "status": "venue_missing",
+            "reason": (
+                f"no {key[1]} {key[0]} position on the venue for {misses} consecutive "
+                "reads — the leg was closed venue-side (stop fill or netted away); "
+                "nothing is left for this mirror to manage"
+            ),
+            "recorded_at": now.isoformat(),
+        })
+        summary["venue_missing"] = summary.get("venue_missing", 0) + 1
+        log.warning(
+            "Propr mirror: tracked leg for trade %s (%s %s) has no venue position — "
+            "retiring it as venue_missing", trade_id, key[0], key[1],
+        )
+        _cancel_bracket_legs(propr, key[0], entry)
+        try:
+            from forven.notifications import emit_notification
+            emit_notification(
+                "propr_mirror_venue_missing",
+                severity="warning",
+                source="propr_mirror",
+                title=f"Propr mirrored leg vanished venue-side ({key[0]})",
+                summary=(
+                    f"{entry.get('strategy')} {key[0]} {key[1]} (trade {trade_id}): the venue "
+                    "no longer holds this position — retired from the mirror ledger as "
+                    "venue_missing (stop fill or netted away)."
+                ),
+                body=str(entry.get("reason") or ""),
+                dedupe_key=f"propr_mirror_venue_missing:{trade_id}",
+            )
+        except Exception as exc:
+            log.debug("Could not emit propr mirror venue-missing notification: %s", exc)
+
+
 def _reconcile_unmanaged_positions(propr, state: dict, now: datetime, summary: dict) -> None:
     """PROPR-LEDGER-1: report venue positions this mirror is not tracking.
 
@@ -877,29 +1054,34 @@ def _reconcile_unmanaged_positions(propr, state: dict, now: datetime, summary: d
     understand (a hand-placed hedge, a leftover from a previous roster). The
     orphan is surfaced in kv ``forven:propr-mirror:unmanaged`` and notified
     once, so the operator can adopt or flatten it deliberately. A read failure
-    is never fatal — the mirror keeps working."""
+    is never fatal — the mirror keeps working.
+
+    The same read feeds the reverse check, PROPR-LEDGER-2 (see
+    ``_retire_venue_missing_legs``): tracked legs with no venue position left
+    are retired instead of tracked forever."""
     try:
         positions = propr.raw_positions() or []
     except Exception as exc:
         log.debug("Propr mirror: venue position read failed: %s", exc)
         return
 
+    venue_keys = _venue_position_keys(propr, positions)
+    _retire_venue_missing_legs(propr, state, venue_keys, now, summary)
+
     tracked: set[tuple[str, str]] = set()
     for entry in state.values():
         if entry.get("status") != "open":
             continue
-        asset = propr.normalize_asset(str(entry.get("asset") or ""))
-        side = str(entry.get("direction") or "").strip().lower()
-        if asset and side:
-            tracked.add((asset, "long" if side == "long" else "short"))
+        key = _position_key(propr, entry.get("asset"), entry.get("direction"))
+        if key[0]:
+            tracked.add(key)
 
     unmanaged: dict = {}
     for pos in positions:
         if not isinstance(pos, dict):
             continue
         asset = propr.normalize_asset(str(pos.get("asset") or pos.get("coin") or ""))
-        side = str(pos.get("positionSide") or pos.get("side") or "").strip().lower()
-        side = "long" if side not in ("long", "short") else side
+        side = propr.position_side(pos)
         if not asset or (asset, side) in tracked:
             continue
         unmanaged[f"{asset}:{side}"] = {
@@ -1126,7 +1308,7 @@ def mirror_tick() -> dict:
     # --- prune aged terminal entries ----------------------------------------
     cutoff = now - timedelta(days=_STATE_RETENTION_DAYS)
     for trade_id, entry in list(state.items()):
-        if entry.get("status") in ("closed", "skipped", "failed", "close_failed"):
+        if entry.get("status") in ("closed", "skipped", "failed", "close_failed", "venue_missing"):
             # Terminal records without their own timestamp (skips/failures) are
             # stamped now so they show on the page for the retention window
             # instead of being pruned in the same tick that wrote them.
