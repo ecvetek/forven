@@ -4821,6 +4821,23 @@ def _duplicate_symbol_variants(symbol: str, params: dict | None = None) -> list[
         variants.update({canonical, f"{base}-{quote}", f"{base}{quote}"})
         if quote == "USDT":
             variants.add(base)
+    # SYMBOL-DUP-3: a glued legacy spelling ('SOLUSDT') has no separator, so
+    # the strict normaliser reads it as a bare base and canonicalises it to
+    # 'SOLUSDT/USDT' — the variant set above then never contains 'SOL/USDT',
+    # and a glued CANDIDATE sails past a canonical INCUMBENT (the reverse of
+    # the orientation the canonical branch covers). Split a trailing known
+    # quote (longest first, so 'FDUSD' wins over 'USD') and add that reading's
+    # variants too. A false split (e.g. 'PYUSD' → 'PY/USD') only widens the
+    # duplicate net, which is the safe direction.
+    if raw and "/" not in raw and "-" not in raw and re.fullmatch(r"[A-Z0-9]+", raw):
+        for quote in sorted(_KNOWN_QUOTE_CURRENCIES, key=len, reverse=True):
+            if raw.endswith(quote):
+                glued_base = raw[: -len(quote)]
+                if re.fullmatch(r"[A-Z0-9]{2,8}", glued_base):
+                    variants.update({f"{glued_base}/{quote}", f"{glued_base}-{quote}"})
+                    if quote == "USDT":
+                        variants.add(glued_base)
+                    break
     variants.discard("")
     return sorted(variants) if variants else [raw]
 
