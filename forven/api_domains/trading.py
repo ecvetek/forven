@@ -22,7 +22,6 @@ from forven.trade_state import (
     is_local_only_paper_trade,
     mark_trade_pending_close_reconcile,
     parse_trade_signal_data,
-    trade_reached_exchange,
 )
 
 log = logging.getLogger("forven.api")
