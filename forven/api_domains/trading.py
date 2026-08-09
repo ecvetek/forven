@@ -22,6 +22,7 @@ from forven.trade_state import (
     is_local_only_paper_trade,
     mark_trade_pending_close_reconcile,
     parse_trade_signal_data,
+    trade_reached_exchange,
 )
 
 log = logging.getLogger("forven.api")
@@ -1156,6 +1157,66 @@ def _force_close_exchange_backed_trade(trade_id: str, body) -> dict[str, object]
     }
 
 
+def _force_close_local_paper_trade(trade_id: str, trade: dict, body) -> dict:
+    """Close a local-only paper-lane row at the current mid, entirely
+    off-exchange (PAPER-CLOSE-1). Refuses (no state change) when no mid is
+    available: closing at entry or a stale price would fabricate P&L, and the
+    operator can simply retry."""
+    asset = str(trade.get("asset") or "").strip().upper()
+    direction = str(trade.get("direction") or "long").strip().lower()
+    try:
+        from forven.exchange.hyperliquid import get_all_mids  # read-only price fetch
+
+        mark = _coerce_optional_float((get_all_mids(_resolve_exchange_testnet()) or {}).get(asset))
+    except Exception as exc:
+        return {"ok": False, "error": f"no current price for {asset}: {exc}"}
+    if mark is None or mark <= 0:
+        return {
+            "ok": False,
+            "error": f"no current price for {asset}; a paper force-close needs a mark to close at",
+        }
+
+    close_note = str(body.reason or "").strip() or None
+    closed = close_trade_record(
+        trade_id,
+        signal_exit_price=mark,
+        exit_price=mark,
+        close_reason="manual_force_close",
+        close_price_source="paper_mark",
+        closed_at=_now(),
+        extra_signal_data={"manual_close_note": close_note},
+    )
+    if not closed or not closed.get("updated"):
+        return {"ok": False, "error": "Failed to persist force-close"}
+    release(trade_id)
+    log_activity(
+        "warning",
+        "api",
+        f"Manual force-close executed for paper trade {trade_id} (local close, no exchange order)",
+        {
+            "trade_id": trade_id,
+            "asset": asset,
+            "direction": direction,
+            "size": float(trade.get("size") or 0.0),
+            "exit_price": closed.get("exit_price"),
+            "reason": close_note or "manual_force_close",
+            "execution_type": str(trade.get("execution_type") or ""),
+        },
+    )
+    return {
+        "ok": True,
+        "trade_id": trade_id,
+        "asset": asset,
+        "direction": direction,
+        "close_side": "sell" if direction == "long" else "buy",
+        "exit_price": round(float(closed["exit_price"]), 8) if closed.get("exit_price") is not None else None,
+        "pnl_pct": round(float(closed["pnl_pct"]), 6) if closed.get("pnl_pct") is not None else None,
+        "pnl_usd": round(float(closed["pnl_usd"]), 4) if closed.get("pnl_usd") is not None else None,
+        "closed_at": closed.get("closed_at"),
+        "source": "paper_local",
+    }
+
+
 def force_close_trade(trade_id: str, body):
     trade_id = trade_id.strip()
     if not trade_id:
@@ -1178,6 +1239,17 @@ def force_close_trade(trade_id: str, body):
         return {"ok": False, "error": "Trade asset is missing"}
     if size <= 0:
         return {"ok": False, "error": "Trade size must be > 0"}
+
+    # PAPER-CLOSE-1: a local-only paper row is a DB record, not a venue
+    # position — its force-close must never reach the exchange. 2026-08-07:
+    # this path sent nine reduce-only close orders to Hyperliquid MAINNET for
+    # paper-lane rows during an operator sweep; every one was rejected only
+    # because the master wallet happened to hold no reducible position. Trades
+    # carrying an exchange correlation id (including paper bot-test fills)
+    # stay on the exchange path below — those DID place venue orders and must
+    # be closed and reconciled there.
+    if is_local_only_paper_trade(trade):
+        return _force_close_local_paper_trade(trade_id, trade, body)
 
     close_side = "sell" if direction == "long" else "buy"
     testnet = _resolve_exchange_testnet()
