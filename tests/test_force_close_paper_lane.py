@@ -10,6 +10,7 @@ import json
 from types import SimpleNamespace
 
 import forven.exchange.hyperliquid as hl
+import forven.trade_state as ts
 from forven.api_domains.trading import force_close_trade
 from forven.db import get_db
 
@@ -39,7 +40,7 @@ def test_paper_force_close_never_touches_the_exchange(forven_db, monkeypatch):
     with get_db() as conn:
         _insert_open_trade(conn, "t-paper")
     _forbid_exchange_orders(monkeypatch)
-    monkeypatch.setattr(hl, "get_all_mids", lambda testnet=False: {"ETH": 2500.0})
+    monkeypatch.setattr(ts, "_fresh_mark_price", lambda asset: 2500.0)
 
     result = force_close_trade("t-paper", SimpleNamespace(reason="sweep"))
     assert result["ok"] is True
@@ -58,7 +59,7 @@ def test_paper_challenger_force_close_never_touches_the_exchange(forven_db, monk
     with get_db() as conn:
         _insert_open_trade(conn, "t-chal", execution_type="paper_challenger")
     _forbid_exchange_orders(monkeypatch)
-    monkeypatch.setattr(hl, "get_all_mids", lambda testnet=False: {"ETH": 2400.0})
+    monkeypatch.setattr(ts, "_fresh_mark_price", lambda asset: 2400.0)
 
     result = force_close_trade("t-chal", SimpleNamespace(reason=None))
     assert result["ok"] is True
@@ -66,12 +67,12 @@ def test_paper_challenger_force_close_never_touches_the_exchange(forven_db, monk
 
 
 def test_paper_force_close_without_a_mark_refuses_and_stays_open(forven_db, monkeypatch):
-    """No mid available: refuse rather than fabricate an exit price — and still
-    never touch the exchange."""
+    """No fresh mark from the configured market-data source: refuse rather
+    than fabricate an exit price — and still never touch the exchange."""
     with get_db() as conn:
         _insert_open_trade(conn, "t-nomark")
     _forbid_exchange_orders(monkeypatch)
-    monkeypatch.setattr(hl, "get_all_mids", lambda testnet=False: {})
+    monkeypatch.setattr(ts, "_fresh_mark_price", lambda asset: None)
 
     result = force_close_trade("t-nomark", SimpleNamespace(reason="sweep"))
     assert result["ok"] is False
@@ -79,6 +80,33 @@ def test_paper_force_close_without_a_mark_refuses_and_stays_open(forven_db, monk
     with get_db() as conn:
         row = conn.execute("SELECT status FROM trades WHERE id = 't-nomark'").fetchone()
     assert row["status"] == "OPEN"
+
+
+def test_paper_force_close_applies_the_kernel_cost_override(forven_db, monkeypatch):
+    """Kernel-managed rows must book P&L through the kernel's net cost
+    convention (Codex P1 on #115): a gross-P&L close would inflate the paper
+    sandbox equity that sizes subsequent trades. Pin that the hook is wired by
+    asserting its cost metadata reaches the persisted row."""
+    import forven.api_domains.paper_control as pc
+
+    with get_db() as conn:
+        _insert_open_trade(conn, "t-kernel")
+    _forbid_exchange_orders(monkeypatch)
+    monkeypatch.setattr(ts, "_fresh_mark_price", lambda asset: 2500.0)
+    monkeypatch.setattr(
+        pc,
+        "_manual_paper_close_pnl_override",
+        lambda trade, mark: (None, {"kernel_cost_marker": f"wired@{mark}"}),
+    )
+
+    result = force_close_trade("t-kernel", SimpleNamespace(reason="sweep"))
+    assert result["ok"] is True
+
+    with get_db() as conn:
+        row = conn.execute("SELECT signal_data FROM trades WHERE id = 't-kernel'").fetchone()
+    assert "wired@2500.0" in str(row["signal_data"]), (
+        "the kernel P&L override hook must run on the paper force-close path"
+    )
 
 
 def test_paper_row_with_exchange_correlation_keeps_the_exchange_path(forven_db, monkeypatch):

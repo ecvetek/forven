@@ -1157,23 +1157,36 @@ def _force_close_exchange_backed_trade(trade_id: str, body) -> dict[str, object]
 
 
 def _force_close_local_paper_trade(trade_id: str, trade: dict, body) -> dict:
-    """Close a local-only paper-lane row at the current mid, entirely
-    off-exchange (PAPER-CLOSE-1). Refuses (no state change) when no mid is
-    available: closing at entry or a stale price would fabricate P&L, and the
-    operator can simply retry."""
+    """Close a local-only paper-lane row at the current mark, entirely
+    off-exchange (PAPER-CLOSE-1). Mirrors close_open_paper_trades_for_strategy,
+    the lifecycle paper-close path: the mark comes from the CONFIGURED
+    market-data source via _fresh_mark_price (which refuses stale or
+    unavailable prices — a Binance-priced paper book must not book exits
+    against Hyperliquid mids), and kernel-managed rows book P&L through the
+    kernel's net cost convention so a gross-P&L close cannot inflate the paper
+    sandbox equity that sizes subsequent trades. No fresh mark → refuse with
+    no state change; the operator can simply retry."""
+    from forven.trade_state import _fresh_mark_price
+
     asset = str(trade.get("asset") or "").strip().upper()
     direction = str(trade.get("direction") or "long").strip().lower()
-    try:
-        from forven.exchange.hyperliquid import get_all_mids  # read-only price fetch
-
-        mark = _coerce_optional_float((get_all_mids(_resolve_exchange_testnet()) or {}).get(asset))
-    except Exception as exc:
-        return {"ok": False, "error": f"no current price for {asset}: {exc}"}
-    if mark is None or mark <= 0:
+    mark = _fresh_mark_price(asset)
+    if mark is None:
         return {
             "ok": False,
-            "error": f"no current price for {asset}; a paper force-close needs a mark to close at",
+            "error": (
+                f"no fresh mark for {asset} from the configured market-data source — "
+                "a paper force-close needs a trustworthy price; retry shortly"
+            ),
         }
+
+    pnl_override, cost_signal_data = None, None
+    try:
+        from forven.api_domains.paper_control import _manual_paper_close_pnl_override
+
+        pnl_override, cost_signal_data = _manual_paper_close_pnl_override(trade, mark)
+    except Exception:
+        pnl_override, cost_signal_data = None, None
 
     close_note = str(body.reason or "").strip() or None
     closed = close_trade_record(
@@ -1183,7 +1196,11 @@ def _force_close_local_paper_trade(trade_id: str, trade: dict, body) -> dict:
         close_reason="manual_force_close",
         close_price_source="paper_mark",
         closed_at=_now(),
-        extra_signal_data={"manual_close_note": close_note},
+        extra_signal_data={
+            "manual_close_note": close_note,
+            **(cost_signal_data or {}),
+        },
+        pnl_override=pnl_override,
     )
     if not closed or not closed.get("updated"):
         return {"ok": False, "error": "Failed to persist force-close"}
