@@ -1160,6 +1160,13 @@ async def _call_openai(
         "messages": all_messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        # Some "OpenAI-compatible" gateways (e.g. Omniroute) default to SSE
+        # streaming when this key is simply absent, unlike OpenAI's own API
+        # (which defaults missing `stream` to false) — this non-streaming
+        # caller then chokes on the SSE body's first byte trying to
+        # json.loads() it. Explicit here is a no-op for every provider that
+        # already defaults correctly.
+        "stream": False,
     }
     if response_schema:
         body["response_format"] = {
@@ -1196,7 +1203,24 @@ async def _call_openai(
             continue
 
         resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            content_type = resp.headers.get("content-type", "unknown")
+            body_preview = resp.text[:200].strip()
+            last_error = RuntimeError(
+                f"{provider_label}: non-JSON response from {url} "
+                f"(HTTP {resp.status_code}, content-type={content_type})"
+                + (f" body_preview={body_preview!r}" if body_preview else " (empty body)")
+            )
+            last_error.__cause__ = exc
+            log.warning(
+                "%s/%s: non-JSON response (attempt %d/%d): %s",
+                provider_label, model, attempt + 1, _max_retries, last_error,
+            )
+            if attempt + 1 < _max_retries:
+                await asyncio.sleep(0.5)
+            continue
 
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") if isinstance(choice, dict) else None

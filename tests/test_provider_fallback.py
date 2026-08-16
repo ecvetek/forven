@@ -269,6 +269,146 @@ def test_call_single_still_rejects_truly_unknown_provider():
 
 
 # --------------------------------------------------------------------------- #
+# Regression: bot-factory decision calls on omniroute failed with
+# "Expecting value: line 1 column 1 (char 0)". _call_openai() (the shared
+# OpenAI-compatible caller behind omniroute/openrouter/groq/gemini/...) never
+# sent a "stream" key; Omniroute defaults to SSE streaming when it's absent,
+# so resp.json() choked on the SSE body's first byte. Verified live against a
+# real Omniroute install in the sibling fix (agents/providers.py
+# OmniRouteProvider.call()) that this exact request shape, minus "stream":
+# false, returns Content-Type: text/event-stream instead of JSON.
+# --------------------------------------------------------------------------- #
+def test_call_openai_sends_stream_false():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from forven.ai import _call_single
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {
+        "choices": [{"message": {"content": "pong"}}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+    }
+    captured: dict = {}
+
+    async def _post(url, json=None, headers=None):
+        captured["url"] = url
+        captured["json"] = json
+        return mock_response
+
+    async def _run():
+        with patch("forven.ai.get_profile", return_value={"base_url": "http://127.0.0.1:8787", "access": "sk-test"}):
+            with patch("forven.ai.get_token", return_value="sk-test"):
+                with patch("forven.ai.httpx.AsyncClient") as MockClient:
+                    mock_client = MagicMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock(return_value=False)
+                    mock_client.post = AsyncMock(side_effect=_post)
+                    MockClient.return_value = mock_client
+                    return await _call_single(
+                        "omniroute", "openrouter/openai/gpt-5.6-luna",
+                        [{"role": "user", "content": "hi"}], 64, 0.0, "sys",
+                    )
+
+    result = asyncio.run(_run())
+    assert result == "pong"
+    assert captured["url"] == "http://127.0.0.1:8787/v1/chat/completions"
+    assert captured["json"]["stream"] is False
+
+
+def test_call_openai_retries_then_succeeds_on_non_json_body():
+    import asyncio
+    import json as json_module
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from forven.ai import _call_single
+
+    bad_response = MagicMock()
+    bad_response.status_code = 200
+    bad_response.raise_for_status = MagicMock()
+    bad_response.headers = {"content-type": "text/event-stream"}
+    bad_response.text = ": OPENROUTER PROCESSING\n\n"
+    bad_response.json.side_effect = json_module.JSONDecodeError("Expecting value", "", 0)
+
+    good_response = MagicMock()
+    good_response.status_code = 200
+    good_response.raise_for_status = MagicMock()
+    good_response.json.return_value = {
+        "choices": [{"message": {"content": "recovered"}}],
+        "usage": {},
+    }
+
+    responses = [bad_response, good_response]
+
+    async def _post(url, json=None, headers=None):
+        return responses.pop(0)
+
+    async def _run():
+        with patch("forven.ai.get_profile", return_value={"base_url": "http://127.0.0.1:8787", "access": "sk-test"}):
+            with patch("forven.ai.get_token", return_value="sk-test"):
+                with patch("forven.ai.asyncio.sleep", new=AsyncMock()):
+                    with patch("forven.ai.httpx.AsyncClient") as MockClient:
+                        mock_client = MagicMock()
+                        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                        mock_client.__aexit__ = AsyncMock(return_value=False)
+                        mock_client.post = AsyncMock(side_effect=_post)
+                        MockClient.return_value = mock_client
+                        return await _call_single(
+                            "omniroute", "openrouter/openai/gpt-5.6-luna",
+                            [{"role": "user", "content": "hi"}], 64, 0.0, "sys",
+                        )
+
+    result = asyncio.run(_run())
+    assert result == "recovered"
+    assert responses == []  # both mocked responses consumed
+
+
+def test_call_openai_raises_clear_error_when_non_json_body_persists():
+    import asyncio
+    import json as json_module
+
+    import pytest
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from forven.ai import _call_single
+
+    bad_response = MagicMock()
+    bad_response.status_code = 200
+    bad_response.raise_for_status = MagicMock()
+    bad_response.headers = {"content-type": "text/event-stream"}
+    bad_response.text = ": OPENROUTER PROCESSING\n\n"
+    bad_response.json.side_effect = json_module.JSONDecodeError("Expecting value", "", 0)
+
+    async def _post(url, json=None, headers=None):
+        return bad_response
+
+    async def _run():
+        with patch("forven.ai.get_profile", return_value={"base_url": "http://127.0.0.1:8787", "access": "sk-test"}):
+            with patch("forven.ai.get_token", return_value="sk-test"):
+                with patch("forven.ai.asyncio.sleep", new=AsyncMock()):
+                    with patch("forven.ai.httpx.AsyncClient") as MockClient:
+                        mock_client = MagicMock()
+                        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                        mock_client.__aexit__ = AsyncMock(return_value=False)
+                        mock_client.post = AsyncMock(side_effect=_post)
+                        MockClient.return_value = mock_client
+                        return await _call_single(
+                            "omniroute", "openrouter/openai/gpt-5.6-luna",
+                            [{"role": "user", "content": "hi"}], 64, 0.0, "sys",
+                        )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(_run())
+
+    message = str(exc_info.value)
+    assert "non-json response" in message.lower()
+    assert "200" in message
+    assert "text/event-stream" in message
+
+
+# --------------------------------------------------------------------------- #
 # B-8: tool-loop provider fallback must not replay side-effecting tools.
 # Each fallback attempt restarts from the ORIGINAL messages, so falling back
 # after a tool executed would re-invoke create_strategy/place_order/etc.
