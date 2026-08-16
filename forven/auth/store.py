@@ -529,17 +529,33 @@ def credential_status(provider: str) -> str:
 
 
 def get_status_rows() -> list[tuple[str, str, str]]:
-    """Get auth status as table rows: (provider, status, expires)."""
+    """Get auth status as table rows: (provider, status, expires).
+
+    Iterates every provider Forven can connect (``_SUPPORTED_AUTH_PROVIDERS``,
+    the same allow-list that gates what ``upsert_auth_provider`` will persist),
+    not a hardcoded subset — this used to loop over just
+    ``["openai", "minimax", "lmstudio"]``, a list frozen from when those were
+    the only three providers, so every provider added afterwards (Z.AI,
+    OpenRouter, Anthropic, ..., Omniroute) never showed up here even when
+    fully connected, and the diagnostics ``auth_providers`` check kept
+    reporting "no provider has a valid token" regardless of what was actually
+    configured. ``sorted()`` because the allow-list is a ``set`` — iterating
+    it directly would give an unstable row order across process restarts.
+    """
     store = load_auth()
     rows = []
-    for provider in ["openai", "minimax", "lmstudio"]:
+    for provider in sorted(_SUPPORTED_AUTH_PROVIDERS):
         profile = store["profiles"].get(f"{provider}:default")
         if not profile:
             rows.append((provider, "[red]Not configured[/red]", "-"))
             continue
 
-        if provider == "lmstudio":
-            base_url = str(profile.get("base_url") or "").strip()
+        access = str(profile.get("access") or profile.get("token") or profile.get("api_key") or "").strip()
+        base_url = str(profile.get("base_url") or "").strip()
+
+        if not access:
+            # Token-optional local providers (e.g. LM Studio) connect via
+            # base_url alone.
             if base_url:
                 rows.append((provider, "[green]Active[/green]", base_url))
             else:
@@ -548,7 +564,10 @@ def get_status_rows() -> list[tuple[str, str, str]]:
 
         expires = profile.get("expires")
         if not expires:
-            rows.append((provider, "[green]Active[/green]", "No expiry"))
+            # Plain API-key providers (most of them) have no OAuth-style
+            # expiry — show the base_url instead when there is one (e.g.
+            # Omniroute, Z.AI), otherwise just note there's no expiry to track.
+            rows.append((provider, "[green]Active[/green]", base_url or "No expiry"))
             continue
 
         now_ms = time.time() * 1000
