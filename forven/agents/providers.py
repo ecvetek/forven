@@ -745,6 +745,116 @@ class LMStudioProvider(ToolCallProvider):
             })
 
 
+class OmniRouteProvider(ToolCallProvider):
+    """Omniroute — local self-hosted OpenAI-compatible model router.
+
+    Aggregates the operator's own connectors (OpenAI, Claude, OpenRouter, ...)
+    behind one local server. Model ids are the underlying connector's own
+    path, passed through unchanged (e.g. ``openrouter/openai/gpt-5.6-luna``).
+    Unlike LM Studio there is no universal default port — every install picks
+    its own — and unlike LM Studio the API key is required, not optional.
+    """
+
+    def __init__(self):
+        self._openai_tools: list[dict] | None = None
+
+    @staticmethod
+    def _get_base_url() -> str:
+        profile = get_profile("omniroute") or {}
+        base_url = str(profile.get("base_url") or "").strip()
+        if not base_url:
+            raise ValueError("omniroute base_url not configured")
+        return base_url.rstrip("/")
+
+    async def stream(self, model_id, messages, system, tools, token):
+        if self._openai_tools is None:
+            self._openai_tools = _to_openai_tools(tools)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {str(token or '').strip()}",
+        }
+        body = {
+            "model": model_id,
+            "messages": _build_openai_messages(system, messages),
+            "max_tokens": _AGENT_MAX_TOKENS, "temperature": 0.7,
+            "tools": self._openai_tools, "tool_choice": "auto",
+        }
+        endpoint = f"{self._get_base_url()}/v1/chat/completions"
+        async for ev in _stream_openai_chat(endpoint, headers, body, include_usage=False):
+            yield ev
+
+    async def call(self, model_id, messages, system, tools, token):
+        if self._openai_tools is None:
+            self._openai_tools = _to_openai_tools(tools)
+
+        openai_messages = _build_openai_messages(system, messages)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {str(token or '').strip()}",
+        }
+        body = {
+            "model": model_id,
+            "messages": openai_messages,
+            "max_tokens": _AGENT_MAX_TOKENS,
+            "temperature": 0.7,
+            "tools": self._openai_tools,
+            "tool_choice": "auto",
+        }
+        endpoint = f"{self._get_base_url()}/v1/chat/completions"
+
+        async with httpx.AsyncClient(timeout=build_provider_timeout()) as client:
+            resp = await client.post(endpoint, json=body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        choice = (data.get("choices") or [{}])[0]
+        assistant = choice.get("message") or {}
+        finish_reason = str(choice.get("finish_reason") or "").strip().lower()
+        assistant_text = _coerce_openai_text(assistant.get("content"))
+        reasoning = str(assistant.get("reasoning_content") or "").strip() or None
+        raw_tool_calls = assistant.get("tool_calls") or []
+        usage = data.get("usage", {})
+
+        tool_calls: list[ToolCall] = []
+        for tc in raw_tool_calls:
+            fn = tc.get("function") or {}
+            name = str(fn.get("name", "")).strip()
+            raw_args = fn.get("arguments", "{}")
+            try:
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                parsed_args = {}
+            if not isinstance(parsed_args, dict):
+                parsed_args = {"value": parsed_args}
+            tool_calls.append(ToolCall(id=str(tc.get("id", "")), name=name, input=parsed_args))
+
+        raw_msg: dict = {"role": "assistant", "content": assistant_text}
+        if raw_tool_calls:
+            raw_msg["tool_calls"] = raw_tool_calls
+
+        return ProviderResponse(
+            text=assistant_text.strip(),
+            tool_calls=tool_calls,
+            stop=(not tool_calls),
+            raw_assistant_message=raw_msg,
+            usage=usage,
+            reasoning=reasoning,
+            truncated=(finish_reason == "length"),
+        )
+
+    def append_assistant(self, messages, response):
+        messages.append(response.raw_assistant_message)
+
+    def append_tool_results(self, messages, results):
+        for tid, content in results:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tid,
+                "content": content,
+            })
+
+
 class ZAIProvider(ToolCallProvider):
     """Z.AI tool-call adapter supporting OpenAI- and Anthropic-compatible endpoints."""
 
@@ -1236,6 +1346,8 @@ def _construct_provider(name: str) -> ToolCallProvider:
         return LMStudioProvider()
     if name == "zai":
         return ZAIProvider()
+    if name == "omniroute":
+        return OmniRouteProvider()
     if name == "openrouter":
         return OpenRouterProvider()
     if name == "anthropic":

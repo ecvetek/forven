@@ -107,6 +107,7 @@ from forven.providers.discovery import (  # noqa: F401
     _looks_like_minimax_discovery_model,
     _looks_like_mistral_discovery_model,
     _looks_like_nvidia_discovery_model,
+    _looks_like_omniroute_discovery_model,
     _looks_like_opencode_discovery_model,
     _looks_like_openai_discovery_model,
     _looks_like_xai_discovery_model,
@@ -806,6 +807,7 @@ def _build_auth_provider_payload(provider: str) -> dict:
         "refresh_command": refresh_command,
         "supports_oauth": _provider_supports_oauth(provider),
         "requires_token": _provider_requires_token(provider),
+        "supports_base_url": provider in _LOCAL_PROVIDER_DEFAULT_BASE_URLS,
         "base_url": base_url,
     }
     # "connected" = explicitly connected in-app (authorizes spend). Distinct from
@@ -4636,13 +4638,14 @@ def upsert_auth_provider(provider: str, body: AuthProviderProfileBody):
     if expires_ms is not None:
         profile["expires"] = expires_ms
 
-    if normalized_provider == "lmstudio":
+    if normalized_provider in ("lmstudio", "omniroute"):
         if base_url:
             profile["base_url"] = _normalize_local_base_url(normalized_provider, base_url)
         elif not profile.get("base_url"):
-            raise HTTPException(status_code=400, detail="base_url required to create profile for lmstudio")
-        profile.pop("refresh", None)
-        profile.pop("expires", None)
+            raise HTTPException(status_code=400, detail=f"base_url required to create profile for {normalized_provider}")
+        if normalized_provider == "lmstudio":
+            profile.pop("refresh", None)
+            profile.pop("expires", None)
     elif normalized_provider == "zai" and base_url:
         profile["base_url"] = _normalize_local_base_url(normalized_provider, base_url, use_default=False)
 
@@ -4650,11 +4653,13 @@ def upsert_auth_provider(provider: str, body: AuthProviderProfileBody):
         raise HTTPException(status_code=400, detail=f"invalid credentials payload for {normalized_provider}")
 
     # Reject a definitively-invalid key at entry time. Only when a new token is
-    # being set (not a base_url-only update) and never for lmstudio (local, no
-    # key to verify). _verify_provider_key raises HTTPException(400) on a hard
-    # rejection (400/401/403); transient/unverifiable outcomes are tolerated so
-    # a network blip can't block a legitimate save.
-    if access_token and normalized_provider != "lmstudio":
+    # being set (not a base_url-only update); skipped for lmstudio (local, no
+    # key to verify) and omniroute (verified against its own per-profile
+    # base_url by test_auth_provider below, not a static endpoint).
+    # _verify_provider_key raises HTTPException(400) on a hard rejection
+    # (400/401/403); transient/unverifiable outcomes are tolerated so a
+    # network blip can't block a legitimate save.
+    if access_token and normalized_provider not in ("lmstudio", "omniroute"):
         _verify_provider_key(normalized_provider, access_token)
 
     upsert_profile(normalized_provider, profile)
@@ -4772,6 +4777,30 @@ def test_auth_provider(provider: str):
             "provider": normalized_provider,
             "status": _build_auth_provider_payload(normalized_provider)["status"],
             "message": f"Connected to LM Studio ({len(models)} models discovered)",
+        }
+
+    if normalized_provider == "omniroute":
+        profile = get_profile(normalized_provider) or {}
+        base_url = _get_provider_base_url(normalized_provider, profile)
+        if not base_url:
+            raise HTTPException(status_code=400, detail="omniroute base_url missing")
+        token = str(profile.get("access") or profile.get("token") or profile.get("api_key") or "").strip()
+        if not token:
+            raise HTTPException(status_code=400, detail="omniroute API key missing")
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            with httpx.Client(timeout=15) as client:
+                response = client.get(f"{base_url}/v1/models", headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        models = _extract_discovery_models(payload, normalized_provider)
+        return {
+            "ok": True,
+            "provider": normalized_provider,
+            "status": _build_auth_provider_payload(normalized_provider)["status"],
+            "message": f"Connected to Omniroute ({len(models)} models discovered)",
         }
 
     try:

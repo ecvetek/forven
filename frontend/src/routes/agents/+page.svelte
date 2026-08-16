@@ -367,6 +367,7 @@
 			openai: 'OpenAI',
 			minimax: 'MiniMax',
 			zai: 'Z.AI',
+			omniroute: 'Omniroute',
 			openrouter: 'OpenRouter',
 			anthropic: 'Anthropic',
 			deepseek: 'DeepSeek',

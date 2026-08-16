@@ -220,6 +220,19 @@ def resolve_rate(provider: str | None, model_id: str | None) -> tuple[float, flo
         return _ZERO_RATE
     if not mid:
         return None
+    if prov == "omniroute":
+        # Omniroute is a local router over the operator's own connectors, so
+        # its model ids embed the underlying connector as the first path
+        # segment (e.g. "openrouter/openai/gpt-4o-mini", "anthropic/claude-
+        # opus-4-7"). Peel that segment off and re-resolve against the named
+        # connector's own table — recursing again if it's "openrouter" itself.
+        if "/" not in mid:
+            return None
+        head, _, rest = mid.partition("/")
+        head_prov = canonical_provider(head)
+        if not head_prov or head_prov == "omniroute":
+            return None
+        return resolve_rate(head_prov, rest)
     if prov != "openrouter":
         return _lookup(prov, mid)
 
@@ -263,6 +276,14 @@ def fallback_rate(provider: str | None, model_id: str | None = None) -> tuple[fl
         return None
     if prov in FREE_LOCAL_PROVIDERS:
         return _ZERO_RATE
+    if prov == "omniroute":
+        mid = str(model_id or "").strip()
+        if "/" in mid:
+            head, _, rest = mid.partition("/")
+            head_prov = canonical_provider(head)
+            if head_prov and head_prov != "omniroute":
+                return fallback_rate(head_prov, rest)
+        return None
     if prov == "openrouter":
         base, variant = _split_openrouter_variant(str(model_id or "").strip())
         if variant == _OPENROUTER_FREE_VARIANT:

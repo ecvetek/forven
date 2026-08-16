@@ -81,40 +81,38 @@
 		providerActionError = { ...providerActionError, [provider]: err };
 	}
 
-	async function saveProviderToken(provider: string) {
+	/**
+	 * Unified connect action for the token / base-URL fields. A provider may
+	 * show either field alone (most providers show only the token; LM Studio
+	 * shows only the base URL) or both together (Omniroute requires both a
+	 * local base URL and an API key — no existing provider needed that
+	 * combination before it). Whichever fields are non-empty are sent in one
+	 * request; the backend enforces which are actually required per provider.
+	 */
+	async function saveProviderConnect(provider: string, needsToken: boolean, needsBaseUrl: boolean) {
 		const token = (providerTokenInput[provider] ?? '').trim();
-		if (!token) {
+		const url = (providerBaseUrlInput[provider] ?? '').trim();
+		if (needsToken && !token) {
 			setProviderError(provider, 'Enter an API key or access token.');
 			return;
 		}
-		setProviderBusy(provider, true);
-		setProviderError(provider, null);
-		try {
-			await setForvenAuthProvider(provider, { api_key: token });
-			providerTokenInput = { ...providerTokenInput, [provider]: '' };
-			setProviderMessage(provider, 'Connected');
-			await reload();
-		} catch (e) {
-			setProviderError(provider, e instanceof Error ? e.message : 'Failed to save token');
-		} finally {
-			setProviderBusy(provider, false);
-		}
-	}
-
-	async function saveProviderBaseUrl(provider: string) {
-		const url = (providerBaseUrlInput[provider] ?? '').trim();
-		if (!url) {
+		if (needsBaseUrl && !needsToken && !url) {
 			setProviderError(provider, 'Enter a base URL.');
 			return;
 		}
 		setProviderBusy(provider, true);
 		setProviderError(provider, null);
 		try {
-			await setForvenAuthProvider(provider, { base_url: url });
-			setProviderMessage(provider, 'Saved');
+			const payload: { api_key?: string; base_url?: string } = {};
+			if (token) payload.api_key = token;
+			if (url) payload.base_url = url;
+			await setForvenAuthProvider(provider, payload);
+			providerTokenInput = { ...providerTokenInput, [provider]: '' };
+			providerBaseUrlInput = { ...providerBaseUrlInput, [provider]: '' };
+			setProviderMessage(provider, 'Connected');
 			await reload();
 		} catch (e) {
-			setProviderError(provider, e instanceof Error ? e.message : 'Failed to save base URL');
+			setProviderError(provider, e instanceof Error ? e.message : 'Failed to save');
 		} finally {
 			setProviderBusy(provider, false);
 		}
@@ -338,7 +336,8 @@
 				{@const err = providerActionError[key]}
 				{@const oauth = providerOAuthState[key]}
 				{@const connected = connectedLabel(provider)}
-				{@const isBaseUrlProvider = provider.requires_token === false && !provider.supports_oauth}
+				{@const showTokenField = provider.requires_token !== false}
+				{@const showBaseUrlField = provider.supports_base_url === true}
 				{@const statusColor =
 					provider.status === 'active'
 						? 'text-emerald-400 border-emerald-900'
@@ -532,7 +531,7 @@
 							</p>
 						{:else}
 							<div class="flex flex-wrap items-end gap-2">
-								{#if isBaseUrlProvider}
+								{#if showBaseUrlField}
 									<label class="flex-1 min-w-[14rem]">
 										<span class="block text-[10px] uppercase tracking-wider text-[#666] mb-1">Base URL</span>
 										<input
@@ -542,15 +541,8 @@
 											class="terminal-input w-full text-sm font-mono"
 										/>
 									</label>
-									<button
-										type="button"
-										on:click={() => saveProviderBaseUrl(key)}
-										disabled={busy}
-										class="terminal-button-primary text-xs px-3 py-1.5 disabled:opacity-60"
-									>
-										{busy ? 'Saving…' : 'Connect'}
-									</button>
-								{:else}
+								{/if}
+								{#if showTokenField}
 									<label class="flex-1 min-w-[14rem]">
 										<span class="block text-[10px] uppercase tracking-wider text-[#666] mb-1">API key / access token</span>
 										<input
@@ -560,24 +552,24 @@
 											class="terminal-input w-full text-sm font-mono"
 										/>
 									</label>
+								{/if}
+								<button
+									type="button"
+									on:click={() => saveProviderConnect(key, showTokenField, showBaseUrlField)}
+									disabled={busy}
+									class="terminal-button-primary text-xs px-3 py-1.5 disabled:opacity-60"
+								>
+									{busy ? 'Saving…' : 'Connect'}
+								</button>
+								{#if showTokenField && provider.supports_oauth}
 									<button
 										type="button"
-										on:click={() => saveProviderToken(key)}
+										on:click={() => startOAuth(key)}
 										disabled={busy}
-										class="terminal-button-primary text-xs px-3 py-1.5 disabled:opacity-60"
+										class="terminal-button text-xs px-3 py-1.5 disabled:opacity-60"
 									>
-										{busy ? 'Saving…' : 'Connect'}
+										{provider.configured ? 'Re-authenticate' : 'Sign in with OAuth'}
 									</button>
-									{#if provider.supports_oauth}
-										<button
-											type="button"
-											on:click={() => startOAuth(key)}
-											disabled={busy}
-											class="terminal-button text-xs px-3 py-1.5 disabled:opacity-60"
-										>
-											{provider.configured ? 'Re-authenticate' : 'Sign in with OAuth'}
-										</button>
-									{/if}
 								{/if}
 							</div>
 							{#if PROVIDER_SIGNUP_URLS[key]}

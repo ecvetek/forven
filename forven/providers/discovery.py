@@ -24,12 +24,13 @@ from forven.codex_responses import is_openai_oauth_token
 log = logging.getLogger("forven.api")
 
 
-_SUPPORTED_AUTH_PROVIDERS: list[str] = ["openai", "minimax", "lmstudio", "zai", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go"]
+_SUPPORTED_AUTH_PROVIDERS: list[str] = ["openai", "minimax", "lmstudio", "zai", "omniroute", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go"]
 _AUTH_PROVIDER_ENV_VARS = {
     "openai": "OPENAI_API_KEY",
     "minimax": "MINIMAX_API_KEY",
     "lmstudio": "LMSTUDIO_API_KEY",
     "zai": "ZAI_API_KEY",
+    "omniroute": "OMNIROUTE_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
@@ -143,6 +144,7 @@ _MODEL_PROVIDER_DISPLAY_NAMES = {
     "minimax": "MiniMax",
     "lmstudio": "LM Studio",
     "zai": "Z.AI",
+    "omniroute": "Omniroute",
     "openrouter": "OpenRouter",
     "anthropic": "Anthropic",
     "deepseek": "DeepSeek",
@@ -159,6 +161,7 @@ _MODEL_PROVIDER_DISPLAY_NAMES = {
 _LOCAL_PROVIDER_DEFAULT_BASE_URLS = {
     "lmstudio": "http://127.0.0.1:1234",
     "zai": "",
+    "omniroute": "",
 }
 
 _AGENT_MODEL_CATALOG = [
@@ -432,6 +435,13 @@ def _looks_like_zai_discovery_model(model: str) -> bool:
     return lowered.startswith("glm-")
 
 
+def _looks_like_omniroute_discovery_model(model: str) -> bool:
+    # Omniroute's model list is already curated by the operator on the
+    # Omniroute side (their own connector config) — accept anything non-empty,
+    # same as LM Studio.
+    return bool(str(model or "").strip())
+
+
 def _looks_like_anthropic_discovery_model(model: str) -> bool:
     lowered = model.lower().strip()
     return lowered.startswith("claude-") or "claude" in lowered
@@ -531,6 +541,8 @@ def _discovery_model_should_belong(provider: str, model_id: str) -> bool:
         return _looks_like_lmstudio_discovery_model(model_id)
     if provider == "zai":
         return _looks_like_zai_discovery_model(model_id)
+    if provider == "omniroute":
+        return _looks_like_omniroute_discovery_model(model_id)
     if provider == "anthropic":
         return _looks_like_anthropic_discovery_model(model_id)
     if provider == "deepseek":
@@ -720,6 +732,63 @@ def _discover_provider_models(
         headers = {}
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        try:
+            with httpx.Client(timeout=20) as client:
+                response = client.get(f"{base_url}/v1/models", headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            _AGENT_MODEL_LIST_CACHE[provider] = {
+                "fetched_at": now,
+                "models": fallback,
+                "error": str(exc),
+                "source": source,
+            }
+            return fallback, str(exc)
+
+        discovered = _extract_discovery_models(payload, provider)
+        if not discovered:
+            discovery_error = "provider returned no models"
+            discovered = [item["model_id"] for item in fallback]
+        else:
+            source = "provider-api"
+
+        merged = _merge_model_records(
+            provider,
+            [{"model_id": model_id, "label": model_id} for model_id in discovered],
+            fallback,
+        )
+        _AGENT_MODEL_LIST_CACHE[provider] = {
+            "fetched_at": now,
+            "models": merged,
+            "error": discovery_error,
+            "source": source,
+        }
+        return merged, discovery_error
+
+    if provider == "omniroute":
+        profile = get_profile(provider) or {}
+        base_url = _get_provider_base_url(provider, profile)
+        if not base_url:
+            _AGENT_MODEL_LIST_CACHE[provider] = {
+                "fetched_at": now,
+                "models": fallback,
+                "error": "provider profile not configured: omniroute",
+                "source": source,
+            }
+            return fallback, "provider profile not configured: omniroute"
+
+        token = str(profile.get("access") or profile.get("token") or profile.get("api_key") or "").strip()
+        if not token:
+            _AGENT_MODEL_LIST_CACHE[provider] = {
+                "fetched_at": now,
+                "models": fallback,
+                "error": "omniroute API key not configured",
+                "source": source,
+            }
+            return fallback, "omniroute API key not configured"
+
+        headers = {"Authorization": f"Bearer {token}"}
         try:
             with httpx.Client(timeout=20) as client:
                 response = client.get(f"{base_url}/v1/models", headers=headers)

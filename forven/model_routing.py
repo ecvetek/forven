@@ -16,6 +16,7 @@ _SUPPORTED_PROVIDERS: tuple[str, ...] = (
     "minimax",
     "lmstudio",
     "zai",
+    "omniroute",
     "openrouter",
     "anthropic",
     "deepseek",
@@ -53,6 +54,8 @@ _ZAI_PRIMARY_PROVIDER_PRIORITY = [
     # Paid coding-model gateways — below the free tiers by default.
     "opencode-zen",
     "opencode-go",
+    # Local self-hosted router — opt-in, below the built-in gateways by default.
+    "omniroute",
 ]
 
 # Auxiliary task kinds — small/cheap helper models that run *outside* the
@@ -116,6 +119,10 @@ _DEFAULT_MODEL_ROUTING = {
         "nvidia": "meta/llama-3.3-70b-instruct",
         "opencode-zen": "grok-code",
         "opencode-go": "glm-5.2",
+        # Seed default only — Omniroute's real models are entirely dependent
+        # on the operator's own connector config; this is overridden the
+        # moment they connect and enable a discovered model.
+        "omniroute": "openrouter/openai/gpt-4o-mini",
     },
     # Every default chain is SELF-ONLY (fail-closed): a slot NEVER silently falls
     # back to a provider the operator didn't choose for it. A throttled/failed
@@ -169,6 +176,9 @@ _DEFAULT_MODEL_ROUTING = {
         ],
         "opencode-go": [
             {"provider": "opencode-go", "model_id": "glm-5.2"},
+        ],
+        "omniroute": [
+            {"provider": "omniroute", "model_id": "openrouter/openai/gpt-4o-mini"},
         ],
     },
     "auxiliary": copy.deepcopy(_DEFAULT_AUXILIARY_ROUTING),

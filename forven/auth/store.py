@@ -20,7 +20,7 @@ log = logging.getLogger("forven.auth.store")
 
 LOCK_PATH = AUTH_FILE.with_suffix(".lock")
 REFRESH_BUFFER_MS = 5 * 60 * 1000  # 5 minutes before expiry
-_SUPPORTED_AUTH_PROVIDERS = {"openai", "minimax", "lmstudio", "zai", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go"}
+_SUPPORTED_AUTH_PROVIDERS = {"openai", "minimax", "lmstudio", "zai", "omniroute", "openrouter", "anthropic", "deepseek", "groq", "gemini", "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go"}
 _AUTH_SECRET_FIELDS = {"access", "refresh", "token", "id_token", "api_key", "api_secret"}
 
 # Runtime-only marker attached to a profile whose ciphertext could not be
@@ -39,6 +39,7 @@ _ENV_ACCESS_TOKEN_KEYS = {
     "minimax": ("MINIMAX_API_KEY",),
     "lmstudio": ("LMSTUDIO_API_KEY",),
     "zai": ("ZAI_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    "omniroute": ("OMNIROUTE_API_KEY",),
     "openrouter": ("OPENROUTER_API_KEY",),
     "anthropic": ("ANTHROPIC_API_KEY",),
     "deepseek": ("DEEPSEEK_API_KEY",),
@@ -55,6 +56,7 @@ _ENV_ACCESS_TOKEN_KEYS = {
 _ENV_BASE_URL_KEYS = {
     "lmstudio": ("LMSTUDIO_BASE_URL",),
     "zai": ("ZAI_BASE_URL", "ANTHROPIC_BASE_URL"),
+    "omniroute": ("OMNIROUTE_BASE_URL",),
     "anthropic": ("ANTHROPIC_BASE_URL",),
     "deepseek": ("DEEPSEEK_BASE_URL",),
     "groq": ("GROQ_BASE_URL",),

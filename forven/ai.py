@@ -230,7 +230,7 @@ _PROVIDER_ALIAS = {
 }
 
 _KNOWN_PROVIDER_PREFIXES: frozenset[str] = frozenset({
-    "openai", "minimax", "lmstudio", "zai", "openrouter", "groq", "gemini",
+    "openai", "minimax", "lmstudio", "zai", "omniroute", "openrouter", "groq", "gemini",
     "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go",
     "codex", "openai-codex", "local", "lm-studio", "z.ai", "z-ai",
     "open-router", "open_router",
@@ -246,7 +246,7 @@ _KNOWN_PROVIDER_PREFIXES: frozenset[str] = frozenset({
 # enable-list key and the runtime route.) The legacy ambiguous providers
 # (openai/minimax/zai/lmstudio) keep their model-name cross-checks.
 _PROVIDER_PASSTHROUGH: frozenset[str] = frozenset({
-    "openrouter", "anthropic", "deepseek", "groq", "gemini",
+    "openrouter", "omniroute", "anthropic", "deepseek", "groq", "gemini",
     "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go",
 })
 
@@ -365,6 +365,16 @@ def _get_zai_base_url() -> str:
 def _zai_uses_anthropic_api(base_url: str) -> bool:
     lowered = str(base_url or "").strip().lower()
     return "/anthropic" in lowered
+
+
+def _get_omniroute_base_url() -> str:
+    profile = get_profile("omniroute") or {}
+    base_url = str(profile.get("base_url") or "").strip()
+    if not base_url:
+        base_url = _first_env_value("OMNIROUTE_BASE_URL")
+    if not base_url:
+        raise ValueError("omniroute base_url not configured")
+    return base_url.rstrip("/")
 
 
 def _extract_text_from_blocks(content: object) -> str:
@@ -1057,6 +1067,22 @@ async def _call_single(
             response_schema_name=response_schema_name,
             endpoint=ENDPOINTS["openrouter"],
             provider_label="openrouter",
+        )
+    elif provider == "omniroute":
+        # Local self-hosted OpenAI-compatible router; base_url is per-profile
+        # (no fixed endpoint, unlike the gateways below), so it's resolved at
+        # call time instead of living in the static ENDPOINTS table.
+        return await _call_openai(
+            token,
+            model,
+            messages,
+            max_tokens,
+            temperature,
+            system,
+            response_schema=response_schema,
+            response_schema_name=response_schema_name,
+            endpoint=f"{_get_omniroute_base_url()}/v1/chat/completions",
+            provider_label="omniroute",
         )
     elif provider in ("groq", "gemini", "cerebras", "mistral", "xai", "together", "nvidia", "opencode-zen", "opencode-go"):
         # All expose OpenAI-compatible Chat Completions endpoints, so route

@@ -11,6 +11,7 @@ export type ForvenProvider =
 	| 'minimax'
 	| 'lmstudio'
 	| 'zai'
+	| 'omniroute'
 	| 'openrouter'
 	| 'anthropic'
 	| 'deepseek'
@@ -593,6 +594,7 @@ export interface ForvenAuthProviderStatus {
 	refresh_command: string;
 	supports_oauth?: boolean;
 	requires_token?: boolean;
+	supports_base_url?: boolean;
 	base_url?: string | null;
 	last_refresh_error?: string | null;
 	last_refresh_at?: string | null;
