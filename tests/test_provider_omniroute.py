@@ -214,3 +214,103 @@ def test_discover_provider_models_omniroute(monkeypatch):
 
     assert error is None
     assert any(m["model_id"] == "openrouter/openai/gpt-5.6-luna" for m in models)
+
+
+# --------------------------------------------------------------------------- #
+# Regression: T00036 — a Crucible research task on omniroute failed with
+# "JSONDecodeError: Expecting value: line 1 column 1 (char 0)". Root-caused
+# live against a real Omniroute install: OmniRouteProvider.call() (the non-
+# streaming path the agent tool-call loop always uses) never sent a "stream"
+# key, and Omniroute defaults to SSE streaming when it's absent — so
+# resp.json() choked on the SSE body's first byte. Fixed by sending
+# "stream": false explicitly and by wrapping the parse failure in a
+# diagnostic error instead of a bare JSONDecodeError.
+# --------------------------------------------------------------------------- #
+
+def _patch_omniroute_client(monkeypatch, mock_response):
+    import forven.agents.providers as providers
+
+    captured: dict = {}
+
+    async def _post(url, json=None, headers=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return mock_response
+
+    class _FakeAsyncClient:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        post = staticmethod(_post)
+
+    monkeypatch.setattr(
+        providers, "get_profile",
+        lambda provider: {"base_url": "http://127.0.0.1:8787", "access": "sk-test"} if provider == "omniroute" else None,
+    )
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _FakeAsyncClient)
+    return captured
+
+
+def test_omniroute_call_sends_stream_false(monkeypatch):
+    import asyncio
+    from unittest.mock import MagicMock
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {
+        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+    }
+    captured = _patch_omniroute_client(monkeypatch, mock_response)
+
+    inst = OmniRouteProvider()
+    result = asyncio.run(inst.call(
+        "openrouter/openai/gpt-5.6-luna",
+        [{"role": "user", "content": "hi"}], "sys", [], "sk-test",
+    ))
+
+    assert result.text == "ok"
+    assert captured["url"] == "http://127.0.0.1:8787/v1/chat/completions"
+    # The actual bug: this key was missing, so a router that defaults to SSE
+    # streaming when it's absent returned an unparseable body.
+    assert captured["json"]["stream"] is False
+
+
+def test_omniroute_call_raises_clear_error_on_non_json_body(monkeypatch):
+    import asyncio
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+    mock_response.headers = {"content-type": "text/event-stream"}
+    mock_response.text = ": OPENROUTER PROCESSING\n\ndata: {\"id\": 1}\n\n"
+    mock_response.json.side_effect = json_module.JSONDecodeError("Expecting value", "", 0)
+    _patch_omniroute_client(monkeypatch, mock_response)
+
+    inst = OmniRouteProvider()
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(inst.call(
+            "openrouter/openai/gpt-5.6-luna",
+            [{"role": "user", "content": "hi"}], "sys", [], "sk-test",
+        ))
+
+    message = str(exc_info.value)
+    # Must be an actionable message, not the bare original JSONDecodeError —
+    # this is what _error_detail/_exception_summary in agents/runner.py
+    # render verbatim in the UI's "PROVIDER ATTEMPTS" trace.
+    assert "200" in message
+    assert "text/event-stream" in message
+    assert "non-json response" in message.lower()
+
+    from forven.ai import is_transient_provider_exception
+    assert is_transient_provider_exception(exc_info.value)

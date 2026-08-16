@@ -71,6 +71,15 @@ _TRANSIENT_PROVIDER_HINTS = (
     "temporarily unavailable",
     "server error",
     "connection reset",
+    # A gateway that returned HTTP 2xx with a body that isn't valid JSON
+    # (empty, an unexpected SSE stream, an HTML error page, ...) raises a
+    # plain json.JSONDecodeError/RuntimeError with no .status_code/.response
+    # for the checks above to key on. Matches OmniRouteProvider.call()'s
+    # "omniroute: non-JSON response from ..." message (forven/agents/
+    # providers.py) — one retry is cheap insurance against a one-off hiccup
+    # from a local self-hosted router, distinct from a systemic config bug
+    # (which will just fail the same way again and surface normally).
+    "non-json response",
 )
 _TRANSIENT_DB_HINTS = (
     "database is locked",

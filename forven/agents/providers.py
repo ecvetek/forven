@@ -800,13 +800,31 @@ class OmniRouteProvider(ToolCallProvider):
             "temperature": 0.7,
             "tools": self._openai_tools,
             "tool_choice": "auto",
+            # Omniroute defaults to SSE streaming when this key is simply
+            # absent (unlike OpenAI's own API, which defaults missing
+            # `stream` to false) — an omitted key here made this non-
+            # streaming path receive an SSE body and fail json.loads() on
+            # its first byte. Verified live against a real Omniroute
+            # install: identical request without this key returns
+            # `Content-Type: text/event-stream`; with it, a single JSON
+            # `chat.completion` object.
+            "stream": False,
         }
         endpoint = f"{self._get_base_url()}/v1/chat/completions"
 
         async with httpx.AsyncClient(timeout=build_provider_timeout()) as client:
             resp = await client.post(endpoint, json=body, headers=headers)
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                content_type = resp.headers.get("content-type", "unknown")
+                body_preview = resp.text[:200].strip()
+                raise RuntimeError(
+                    f"omniroute: non-JSON response from {endpoint} "
+                    f"(HTTP {resp.status_code}, content-type={content_type})"
+                    + (f" body_preview={body_preview!r}" if body_preview else " (empty body)")
+                ) from exc
 
         choice = (data.get("choices") or [{}])[0]
         assistant = choice.get("message") or {}
